@@ -331,9 +331,6 @@ def _looks_like_noise(s: str) -> bool:
         return True
     if len(s) < MIN_VARIANT_LEN or len(s) > MAX_VARIANT_LEN:
         return True
-    # drop numeric classification-like strings
-    if re.fullmatch(r"[0-9.]+", s):
-        return True
     # drop very sentence-like strings (notes)
     if s.count(" ") >= 6:
         return True
@@ -506,8 +503,8 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Indexing Lab", layout="wide")
-st.title("Indexing Lab")
+st.set_page_config(page_title="1BO416 Indexeringslabb", layout="wide")
+st.title("1BO416 Indexeringslabb")
 
 ensure_state()
 
@@ -549,7 +546,7 @@ expand_query = st.checkbox(
 )
 
 if expand_query:
-    if st.button("Run SAO variant expansion now", key="run_sao_btn"):
+    if st.button("Run SAO expansion now", key="run_sao_btn"):
         st.session_state["run_sao_now"] = True
 else:
     st.session_state["run_sao_now"] = False
@@ -611,7 +608,7 @@ if query.strip():
             if errors:
                 st.warning("\n".join(errors))
             else:
-                st.caption("Tip: Click 'Run SAO variant expansion now' after typing. Results are cached per session.")
+                st.caption("Tip: Click 'Run SAO expansion now' after typing. Results are cached per session.")
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
