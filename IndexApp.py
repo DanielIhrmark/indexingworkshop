@@ -17,7 +17,6 @@ BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
 
 SAO_SCHEME_URI = "https://id.kb.se/term/sao"
-KBV = "https://id.kb.se/vocab/"
 
 
 # -----------------------------
@@ -93,18 +92,16 @@ def sparql_select_json(endpoint: str, sparql: str) -> dict:
 
 
 # -----------------------------
-# SAO: lookup + context (IMPORTANT: uses :mainEntity pattern)
+# SAO: robust label search + SAO filter
 # -----------------------------
 @st.cache_data(ttl=3600)
-def sao_lookup_candidates(endpoint: str, token: str, mode: str, limit: int) -> List[Tuple[str, str]]:
+def label_search_candidates(endpoint: str, token: str, mode: str, limit: int = 50) -> List[Tuple[str, str]]:
     """
-    Returns list of (term_uri, prefLabel) for SAO topics.
-
-    Critical: uses Libris XL metadata pattern:
-        ?meta :mainEntity ?term .
-        ?term :inScheme <...> ; :prefLabel ?label .
-
-    mode: exact | starts | contains
+    Find candidate resources by Swedish label using common predicates:
+      - kbv:prefLabel
+      - skos:prefLabel
+      - rdfs:label
+    Returns (uri, label).
     """
     token = (token or "").strip()
     if len(token) < 2:
@@ -120,14 +117,28 @@ def sao_lookup_candidates(endpoint: str, token: str, mode: str, limit: int) -> L
         label_filter = f'FILTER regex(str(?label), "{re.escape(token)}", "i")'
 
     sparql = f"""
-    PREFIX : <{KBV}>
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
-    SELECT DISTINCT ?term ?label WHERE {{
-      ?meta :mainEntity ?term .
-      ?term :inScheme <{SAO_SCHEME_URI}> ;
-            :prefLabel ?label .
-      FILTER(lang(?label) = "sv")
-      {label_filter}
+    SELECT DISTINCT ?s ?label WHERE {{
+      {{
+        ?s kbv:prefLabel ?label .
+        FILTER(lang(?label) = "sv")
+        {label_filter}
+      }}
+      UNION
+      {{
+        ?s skos:prefLabel ?label .
+        FILTER(lang(?label) = "sv")
+        {label_filter}
+      }}
+      UNION
+      {{
+        ?s rdfs:label ?label .
+        FILTER(lang(?label) = "sv")
+        {label_filter}
+      }}
     }}
     LIMIT {int(limit)}
     """
@@ -135,66 +146,105 @@ def sao_lookup_candidates(endpoint: str, token: str, mode: str, limit: int) -> L
     data = sparql_select_json(endpoint, sparql)
     out = []
     for b in data.get("results", {}).get("bindings", []):
-        out.append((b["term"]["value"], b["label"]["value"]))
+        out.append((b["s"]["value"], b["label"]["value"]))
     return out
 
 
 @st.cache_data(ttl=3600)
-def sao_lookup_best_term(endpoint: str, token: str) -> Tuple[Optional[str], Optional[str]]:
+def filter_to_sao(endpoint: str, uris: List[str], limit: int = 50) -> List[str]:
     """
-    Strategy: exact -> starts-with -> contains; choose shortest label as heuristic.
+    Given candidate URIs, keep only those that appear to belong to SAO.
+    Tries multiple patterns:
+      - kbv:inScheme
+      - skos:inScheme
+      - kbv:inVocabulary
     """
-    cands = sao_lookup_candidates(endpoint, token, mode="exact", limit=20)
-    if cands:
-        return cands[0][0], cands[0][1]
+    if not uris:
+        return []
 
-    cands = sao_lookup_candidates(endpoint, token, mode="starts", limit=200)
-    if cands:
-        best = sorted(cands, key=lambda x: len(x[1]))[0]
-        return best[0], best[1]
+    uris = uris[:200]
+    values = " ".join(f"<{u}>" for u in uris)
 
-    cands = sao_lookup_candidates(endpoint, token, mode="contains", limit=400)
-    if cands:
-        best = sorted(cands, key=lambda x: len(x[1]))[0]
-        return best[0], best[1]
+    sparql = f"""
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 
-    return None, None
+    SELECT DISTINCT ?s WHERE {{
+      VALUES ?s {{ {values} }}
+      {{
+        ?s kbv:inScheme <{SAO_SCHEME_URI}> .
+      }}
+      UNION
+      {{
+        ?s skos:inScheme <{SAO_SCHEME_URI}> .
+      }}
+      UNION
+      {{
+        ?s kbv:inVocabulary <{SAO_SCHEME_URI}> .
+      }}
+    }}
+    LIMIT {int(limit)}
+    """
+
+    data = sparql_select_json(endpoint, sparql)
+    return [b["s"]["value"] for b in data.get("results", {}).get("bindings", [])]
 
 
 @st.cache_data(ttl=3600)
-def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
+def sao_context_raw(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
     """
-    Returns raw phrase labels for:
-      - altLabel
-      - broader prefLabel
-      - narrower prefLabel (inverse broader)
+    Get raw phrases for broader/narrower/altLabel using both KBV and SKOS variants.
+    Narrower uses inverse broader where available.
     """
     sparql = f"""
-    PREFIX : <{KBV}>
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 
     SELECT DISTINCT ?p ?oLabel WHERE {{
       VALUES ?term {{ <{term_uri}> }}
 
       # altLabel
       {{
-        ?term :altLabel ?oLabel .
-        FILTER(lang(?oLabel) = "sv")
+        ?term kbv:altLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
         BIND("altLabel" AS ?p)
       }}
       UNION
-      # broader
       {{
-        ?term :broader ?o .
-        ?o :prefLabel ?oLabel .
-        FILTER(lang(?oLabel) = "sv")
+        ?term skos:altLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("altLabel" AS ?p)
+      }}
+
+      # broader
+      UNION
+      {{
+        ?term kbv:broader ?o .
+        ?o kbv:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
         BIND("broader" AS ?p)
       }}
       UNION
-      # narrower (inverse broader)
       {{
-        ?n :broader ?term .
-        ?n :prefLabel ?oLabel .
-        FILTER(lang(?oLabel) = "sv")
+        ?term skos:broader ?o .
+        ?o skos:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("broader" AS ?p)
+      }}
+
+      # narrower (inverse broader)
+      UNION
+      {{
+        ?n kbv:broader ?term .
+        ?n kbv:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("narrower" AS ?p)
+      }}
+      UNION
+      {{
+        ?n skos:broader ?term .
+        ?n skos:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
         BIND("narrower" AS ?p)
       }}
     }}
@@ -202,66 +252,37 @@ def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
 
     data = sparql_select_json(endpoint, sparql)
     ctx = {"broader": [], "narrower": [], "altLabel": []}
-
     for b in data.get("results", {}).get("bindings", []):
         p = b["p"]["value"]
         lbl = b["oLabel"]["value"]
         if p in ctx:
             ctx[p].append(lbl)
-
     for k in ctx:
         ctx[k] = sorted(list(dict.fromkeys(ctx[k])), key=str.lower)
     return ctx
 
 
-def expand_token_tokens(
-    endpoint: str,
-    token: str,
-    include_hierarchy: bool,
-) -> Tuple[List[str], Dict[str, List[str]], Optional[str], Optional[str]]:
-    """
-    Returns:
-      - expansion tokens (single words) used for local retrieval
-      - raw context labels (phrases)
-      - matched SAO URI + prefLabel
-    """
-    term_uri, term_label = sao_lookup_best_term(endpoint, token)
-    if not term_uri:
-        return [], {"altLabel": [], "broader": [], "narrower": []}, None, None
+def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], List[Tuple[str, str]], List[str]]:
+    # exact -> starts -> contains
+    cands = label_search_candidates(endpoint, token, mode="exact", limit=50)
+    if not cands:
+        cands = label_search_candidates(endpoint, token, mode="starts", limit=100)
+    if not cands:
+        cands = label_search_candidates(endpoint, token, mode="contains", limit=200)
 
-    ctx = sao_term_context(endpoint, term_uri)
+    sao_uris = filter_to_sao(endpoint, [u for (u, _) in cands], limit=100)
 
-    raw_labels = {
-        "altLabel": list(ctx.get("altLabel", [])),
-        "broader": list(ctx.get("broader", [])) if include_hierarchy else [],
-        "narrower": list(ctx.get("narrower", [])) if include_hierarchy else [],
-    }
+    if sao_uris:
+        sao_set = set(sao_uris)
+        sao_cands = [(u, lbl) for (u, lbl) in cands if u in sao_set]
+        if sao_cands:
+            best = sorted(sao_cands, key=lambda x: len(x[1]))[0]
+            return best[0], cands, sao_uris
 
-    labels_for_tokens = list(raw_labels["altLabel"])
-    if include_hierarchy:
-        labels_for_tokens += raw_labels["broader"] + raw_labels["narrower"]
-
-    out_tokens: List[str] = []
-    seen = set()
-    for lbl in labels_for_tokens:
-        for t in tokenize(lbl):
-            if t == token:
-                continue
-            if t in seen:
-                continue
-            seen.add(t)
-            out_tokens.append(t)
-
-    return out_tokens, raw_labels, term_uri, term_label
+    return None, cands, sao_uris
 
 
-def search_with_expansion(
-    inv: Dict[str, set],
-    query: str,
-    endpoint: str,
-    expand: bool,
-    include_hierarchy: bool,
-) -> Tuple[set, List[List[str]], List[str], List[Dict]]:
+def search_with_expansion(inv: Dict[str, set], query: str, endpoint: str, expand: bool, include_hierarchy: bool):
     base_tokens = tokenize(query)
     if not base_tokens:
         return set(), [], [], []
@@ -272,10 +293,13 @@ def search_with_expansion(
 
     for tok in base_tokens:
         g = [tok]
-        dbg_item = {
+        dbg = {
             "token": tok,
-            "matched_uri": None,
-            "matched_prefLabel": None,
+            "best_sao_uri": None,
+            "candidate_count": 0,
+            "candidate_preview": [],
+            "sao_uri_count": 0,
+            "sao_uri_preview": [],
             "raw_altLabel": [],
             "raw_broader": [],
             "raw_narrower": [],
@@ -283,30 +307,37 @@ def search_with_expansion(
 
         if expand:
             try:
-                exp_tokens, raw_labels, uri, pref = expand_token_tokens(endpoint, tok, include_hierarchy)
-                g += exp_tokens
+                best_uri, candidates, sao_uris = best_sao_uri_for_token(endpoint, tok)
 
-                dbg_item["matched_uri"] = uri
-                dbg_item["matched_prefLabel"] = pref
-                dbg_item["raw_altLabel"] = raw_labels.get("altLabel", [])
-                dbg_item["raw_broader"] = raw_labels.get("broader", [])
-                dbg_item["raw_narrower"] = raw_labels.get("narrower", [])
+                dbg["best_sao_uri"] = best_uri
+                dbg["candidate_count"] = len(candidates)
+                dbg["candidate_preview"] = [(lbl, uri) for (uri, lbl) in candidates[:5]]
+                dbg["sao_uri_count"] = len(sao_uris)
+                dbg["sao_uri_preview"] = sao_uris[:5]
+
+                if best_uri:
+                    ctx = sao_context_raw(endpoint, best_uri)
+                    dbg["raw_altLabel"] = ctx.get("altLabel", [])
+                    dbg["raw_broader"] = ctx.get("broader", []) if include_hierarchy else []
+                    dbg["raw_narrower"] = ctx.get("narrower", []) if include_hierarchy else []
+
+                    phrases = list(dbg["raw_altLabel"])
+                    if include_hierarchy:
+                        phrases += dbg["raw_broader"] + dbg["raw_narrower"]
+
+                    for ph in phrases:
+                        for t in tokenize(ph):
+                            if t != tok and t not in g:
+                                g.append(t)
+
             except Exception as e:
                 errors.append(f"SAO expansion failed for '{tok}': {e}")
 
-        # de-dup within group
-        deduped = []
-        seen = set()
-        for t in g:
-            if t not in seen:
-                seen.add(t)
-                deduped.append(t)
+        groups.append(g)
+        debug.append(dbg)
 
-        groups.append(deduped)
-        debug.append(dbg_item)
-
-    # OR within each group, AND across groups
-    group_sets: List[set] = []
+    # OR within group, AND across groups
+    group_sets = []
     for g in groups:
         s = set()
         for t in g:
@@ -318,27 +349,32 @@ def search_with_expansion(
 
 
 # -----------------------------
-# UI
+# UI (IMPORTANT: define variables at top-level first)
 # -----------------------------
 st.set_page_config(page_title="Indexing Lab", layout="wide")
 st.title("Indexing Lab")
 
+# Define defaults BEFORE sidebar so variables always exist
+sheet_url = DEFAULT_SHEET_URL
+sheet_name = ""
+sparql_endpoint = DEFAULT_SPARQL_ENDPOINT
 
 with st.sidebar:
-    sheet_url = st.text_input("Google Sheet URL", DEFAULT_SHEET_URL)
-    sheet_name = st.text_input("Worksheet name (optional)", "")
-    sparql_endpoint = st.text_input("SPARQL endpoint", DEFAULT_SPARQL_ENDPOINT)
+    sheet_url = st.text_input("Google Sheet URL", value=sheet_url)
+    sheet_name = st.text_input("Worksheet name (optional)", value=sheet_name)
+    sparql_endpoint = st.text_input("SPARQL endpoint", value=sparql_endpoint)
+
     if st.button("Refresh data"):
         st.cache_data.clear()
+
     if st.button("Test SPARQL endpoint"):
         try:
             test = sparql_select_json(sparql_endpoint, "SELECT (1 as ?ok) WHERE {} LIMIT 1")
             st.success(f"Endpoint OK: {test['results']['bindings']}")
         except Exception as e:
             st.error(f"Endpoint test failed: {e}")
-        
-df = load_sheet_as_df(sheet_url, sheet_name)
 
+df = load_sheet_as_df(sheet_url, sheet_name)
 if df.empty:
     st.warning("The sheet loaded, but it appears to be empty.")
     st.stop()
@@ -350,7 +386,7 @@ available_index = [f for f in INDEX_FIELDS if f in df.columns]
 
 query = st.text_input("Query")
 
-expand_query = st.checkbox("Expand query using Svenska Ämnesord (SAO)", value=False)
+expand_query = st.checkbox("Expand query using SAO (probe-and-filter)", value=False)
 include_hierarchy = st.checkbox("Include broader/narrower terms", value=True)
 
 mode = st.radio("Search mode", ["Baseline", "Enriched"], horizontal=True)
@@ -366,13 +402,7 @@ else:
 
 inv = build_inverted_index(df, fields, id_col)
 
-ids, groups, errors, debug = search_with_expansion(
-    inv=inv,
-    query=query,
-    endpoint=sparql_endpoint,
-    expand=expand_query,
-    include_hierarchy=include_hierarchy,
-)
+ids, groups, errors, debug = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy)
 
 if query.strip():
     if expand_query:
@@ -380,20 +410,27 @@ if query.strip():
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
-            st.markdown("#### SAO matches and raw related terms (phrases)")
+            st.markdown("#### SAO probe details")
             for item in debug:
                 st.markdown(f"**Token:** `{item['token']}`")
+                st.write("Candidates found by label search:", item["candidate_count"])
+                if item["candidate_preview"]:
+                    st.write("Top candidates (label — URI):")
+                    for lbl, uri in item["candidate_preview"]:
+                        st.write(f"- {lbl}")
+                        st.code(uri)
 
-                if item["matched_uri"]:
-                    st.write("Matched SAO prefLabel:", item["matched_prefLabel"])
-                    st.code(item["matched_uri"])
-                else:
-                    st.write("Matched SAO prefLabel: —")
-                    st.write("Matched SAO URI: —")
+                st.write("Candidates recognized as SAO:", item["sao_uri_count"])
+                if item["sao_uri_preview"]:
+                    st.write("SAO-matching URIs (preview):")
+                    for uri in item["sao_uri_preview"]:
+                        st.code(uri)
 
-                st.write("altLabel:", ", ".join(item["raw_altLabel"]) if item["raw_altLabel"] else "—")
-                st.write("broader:", ", ".join(item["raw_broader"]) if item["raw_broader"] else "—")
-                st.write("narrower:", ", ".join(item["raw_narrower"]) if item["raw_narrower"] else "—")
+                st.write("Best SAO URI:", item["best_sao_uri"] if item["best_sao_uri"] else "—")
+                if item["best_sao_uri"]:
+                    st.write("altLabel:", ", ".join(item["raw_altLabel"]) if item["raw_altLabel"] else "—")
+                    st.write("broader:", ", ".join(item["raw_broader"]) if item["raw_broader"] else "—")
+                    st.write("narrower:", ", ".join(item["raw_narrower"]) if item["raw_narrower"] else "—")
                 st.divider()
 
             if errors:
