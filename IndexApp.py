@@ -2,7 +2,7 @@ import json
 import re
 import time
 import urllib.parse
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 import pandas as pd
 import requests
@@ -14,9 +14,8 @@ import streamlit as st
 # -----------------------------
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/11J5JRtap7p2P8BWl3gsPVs1I-DATbVdOi4Oj1fcSbe0/edit?usp=sharing"
 
-# id.kb.se
 IDKB_FIND_ENDPOINT = "https://id.kb.se/find"
-SAO_SCHEME_URI = "https://id.kb.se/term/sao"  # IMPORTANT: no trailing slash :contentReference[oaicite:1]{index=1}
+SAO_SCHEME_URI = "https://id.kb.se/term/sao"  # no trailing slash
 
 BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
@@ -98,7 +97,12 @@ def http_get_text(url: str, params: Optional[dict] = None) -> str:
     last_err: Optional[Exception] = None
     for attempt in range(0, 1 + HTTP_RETRIES):
         try:
-            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(
+                url,
+                params=params,
+                timeout=HTTP_TIMEOUT_SECONDS,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
             r.raise_for_status()
             return r.text
         except Exception as e:
@@ -111,10 +115,6 @@ def http_get_text(url: str, params: Optional[dict] = None) -> str:
 
 
 def extract_jsonld_objects_from_html(html: str) -> List[Any]:
-    """
-    id.kb.se pages commonly embed JSON-LD in HTML.
-    We extract all <script type="application/ld+json"> blocks and parse them.
-    """
     objs: List[Any] = []
     for m in JSONLD_SCRIPT_RE.finditer(html or ""):
         raw = m.group(1).strip()
@@ -123,35 +123,24 @@ def extract_jsonld_objects_from_html(html: str) -> List[Any]:
         try:
             objs.append(json.loads(raw))
         except Exception:
-            # Some pages may contain multiple JSON objects separated oddly; ignore failures
             continue
     return objs
 
 
 def flatten_jsonld_graph(doc: Any) -> List[dict]:
-    """
-    Turn a JSON-LD document (or list of docs) into a list of node dicts.
-    """
     if isinstance(doc, list):
         out: List[dict] = []
         for d in doc:
             out.extend(flatten_jsonld_graph(d))
         return out
-
     if not isinstance(doc, dict):
         return []
-
     if "@graph" in doc and isinstance(doc["@graph"], list):
         return [n for n in doc["@graph"] if isinstance(n, dict)]
-
-    # sometimes the doc itself is the node
     return [doc]
 
 
-def fetch_jsonld_from_page(url: str, params: Optional[dict] = None) -> List[dict]:
-    """
-    Fetch HTML and extract JSON-LD nodes.
-    """
+def fetch_jsonld_nodes_from_page(url: str, params: Optional[dict] = None) -> List[dict]:
     html = http_get_text(url, params=params)
     jsonld_docs = extract_jsonld_objects_from_html(html)
     nodes: List[dict] = []
@@ -169,9 +158,6 @@ def extract_uri(node: Any) -> Optional[str]:
 
 
 def extract_sv_label(node: dict) -> Optional[str]:
-    """
-    Try common label patterns.
-    """
     for key in ("prefLabel", "label", "name"):
         v = node.get(key)
         if isinstance(v, str):
@@ -203,7 +189,6 @@ def collect_literal_sv_list(v: Any) -> List[str]:
     else:
         add(v)
 
-    # de-dup case-insensitive
     seen = set()
     ded = []
     for s in out:
@@ -240,7 +225,7 @@ def collect_related_uris(nodes: List[dict], predicate: str) -> List[str]:
 
 
 # -----------------------------
-# SAO lookup via id.kb.se/find (HTML + JSON-LD extraction)
+# SAO lookup via id.kb.se/find (HTML + JSON-LD)
 # -----------------------------
 @st.cache_data(ttl=3600)
 def sao_find_candidates(q: str, limit: int = FIND_LIMIT) -> List[dict]:
@@ -251,13 +236,11 @@ def sao_find_candidates(q: str, limit: int = FIND_LIMIT) -> List[dict]:
     params = {
         "q": q,
         "_limit": str(limit),
-        # This filter works in the UI and yields SAO hits for klimat :contentReference[oaicite:2]{index=2}
         "and-inScheme.@id": SAO_SCHEME_URI,
     }
 
-    nodes = fetch_jsonld_from_page(IDKB_FIND_ENDPOINT, params=params)
+    nodes = fetch_jsonld_nodes_from_page(IDKB_FIND_ENDPOINT, params=params)
 
-    # Extract candidate nodes with both uri + label
     cands: List[dict] = []
     for n in nodes:
         uri = extract_uri(n)
@@ -273,7 +256,6 @@ def sao_find_candidates(q: str, limit: int = FIND_LIMIT) -> List[dict]:
             seen.add(c["uri"])
             out.append(c)
 
-    # prefer exact label match, then shorter label
     q_low = q.lower()
     out.sort(key=lambda x: (0 if x["label"].lower() == q_low else 1, len(x["label"])))
     return out[:limit]
@@ -281,10 +263,7 @@ def sao_find_candidates(q: str, limit: int = FIND_LIMIT) -> List[dict]:
 
 @st.cache_data(ttl=3600)
 def fetch_concept_nodes(uri: str) -> List[dict]:
-    """
-    Concept pages also embed JSON-LD; extract nodes from HTML.
-    """
-    return fetch_jsonld_from_page(uri, params=None)
+    return fetch_jsonld_nodes_from_page(uri, params=None)
 
 
 @st.cache_data(ttl=3600)
@@ -327,10 +306,8 @@ def compute_sao_expansion_for_token(token: str, include_hierarchy: bool) -> dict
     chosen = next((c for c in cands if c["label"].lower() == token_low), cands[0])
     payload["chosen"] = chosen
 
-    # Fetch chosen concept JSON-LD
     nodes = fetch_concept_nodes(chosen["uri"])
 
-    # altLabel: try skos:altLabel + altLabel
     alt = []
     for n in nodes:
         if "altLabel" in n:
@@ -350,11 +327,9 @@ def compute_sao_expansion_for_token(token: str, include_hierarchy: bool) -> dict
     if include_hierarchy:
         broader_uris = collect_related_uris(nodes, "broader")[:RELATED_URI_LIMIT]
         narrower_uris = collect_related_uris(nodes, "narrower")[:RELATED_URI_LIMIT]
-
         payload["broader_labels"] = resolve_labels_for_uris(broader_uris, limit=RELATED_LABEL_RESOLVE_LIMIT)
         payload["narrower_labels"] = resolve_labels_for_uris(narrower_uris, limit=RELATED_LABEL_RESOLVE_LIMIT)
 
-    # Build expansion tokens (for retrieval), based on alt/broader/narrower labels
     phrases = []
     phrases.extend(payload["altLabel"])
     if include_hierarchy:
@@ -368,17 +343,20 @@ def compute_sao_expansion_for_token(token: str, include_hierarchy: bool) -> dict
             if t not in seen_tok:
                 seen_tok.add(t)
                 expanded.append(t)
-
     payload["expansion_tokens"] = expanded
     return payload
 
 
 # -----------------------------
-# Search orchestration (explicit run + session cache)
+# Search orchestration (explicit run + sticky session_state)
 # -----------------------------
 def ensure_state():
     if "sao_cache" not in st.session_state:
         st.session_state["sao_cache"] = {}
+    if "enable_sao" not in st.session_state:
+        st.session_state["enable_sao"] = False
+    if "run_sao_now" not in st.session_state:
+        st.session_state["run_sao_now"] = False
 
 
 def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool, include_hierarchy: bool, run_now: bool):
@@ -387,13 +365,22 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
         return set(), [], [], []
 
     ensure_state()
+
     groups: List[List[str]] = []
     errors: List[str] = []
     debug: List[dict] = []
 
     for tok in tokens:
         group = [tok]
-        dbg = {"token": tok, "source": "none", "chosen": None, "candidates": [], "altLabel": [], "broader_labels": [], "narrower_labels": []}
+        dbg = {
+            "token": tok,
+            "source": "Not run (click 'Run SAO expansion now')",
+            "chosen": None,
+            "candidates": [],
+            "altLabel": [],
+            "broader_labels": [],
+            "narrower_labels": [],
+        }
 
         if expand_enabled:
             if run_now or tok in st.session_state["sao_cache"]:
@@ -405,7 +392,6 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
                 except Exception as e:
                     errors.append(f"SAO expansion failed for '{tok}': {e}")
 
-        # de-dup group
         deduped = []
         seen = set()
         for t in group:
@@ -416,7 +402,6 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
         groups.append(deduped)
         debug.append(dbg)
 
-    # OR within group, AND across groups
     sets = []
     for g in groups:
         s = set()
@@ -433,13 +418,16 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
 st.set_page_config(page_title="Indexing Lab", layout="wide")
 st.title("Indexing Lab")
 
-# Define variables top-level to avoid rerun NameErrors
+ensure_state()
+
+# Define variables top-level
 sheet_url = DEFAULT_SHEET_URL
 sheet_name = ""
 
 with st.sidebar:
     sheet_url = st.text_input("Google Sheet URL", value=sheet_url)
     sheet_name = st.text_input("Worksheet name (optional)", value=sheet_name)
+
     if st.button("Refresh data"):
         st.cache_data.clear()
 
@@ -452,12 +440,19 @@ id_col = st.selectbox("ID column", options=list(df.columns))
 
 query = st.text_input("Query")
 
-expand_query = st.checkbox("Enable SAO expansion (id.kb.se/find)", value=False)
+# Sticky SAO enable + one-shot run flag
+expand_query = st.checkbox(
+    "Enable SAO expansion (id.kb.se/find)",
+    value=st.session_state["enable_sao"],
+    key="enable_sao",
+)
 include_hierarchy = st.checkbox("Include broader/narrower terms", value=True)
 
-run_now = False
 if expand_query:
-    run_now = st.button("Run SAO expansion now")
+    if st.button("Run SAO expansion now", key="run_sao_btn"):
+        st.session_state["run_sao_now"] = True
+else:
+    st.session_state["run_sao_now"] = False
 
 mode = st.radio("Search mode", ["Baseline", "Enriched"], horizontal=True)
 
@@ -475,7 +470,16 @@ else:
 
 inv = build_inverted_index(df, fields, id_col)
 
-ids, groups, errors, debug = search_with_expansion(inv, query, expand_query, include_hierarchy, run_now)
+ids, groups, errors, debug = search_with_expansion(
+    inv=inv,
+    query=query,
+    expand_enabled=expand_query,
+    include_hierarchy=include_hierarchy,
+    run_now=st.session_state["run_sao_now"],
+)
+
+# reset one-shot flag after use
+st.session_state["run_sao_now"] = False
 
 if query.strip():
     if expand_query:
@@ -511,7 +515,9 @@ if query.strip():
             if errors:
                 st.warning("\n".join(errors))
             else:
-                st.caption("Tip: On Streamlit Community Cloud, click 'Run SAO expansion now' after typing your query.")
+                st.caption("Tip: Click 'Run SAO expansion now' after typing. Results are cached per session.")
+    else:
+        st.caption("Enable SAO expansion to see vocabulary matches and hierarchy in the debug panel.")
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
