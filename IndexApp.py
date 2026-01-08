@@ -323,6 +323,14 @@ def search_with_expansion(
 st.set_page_config(page_title="Indexing Lab", layout="wide")
 st.title("Indexing Lab")
 
+if st.button("Test SPARQL endpoint"):
+    try:
+        test = sparql_select_json(sparql_endpoint, "SELECT (1 as ?ok) WHERE {} LIMIT 1")
+        st.success(f"Endpoint OK: {test['results']['bindings']}")
+    except Exception as e:
+        st.error(f"Endpoint test failed: {e}")
+
+
 with st.sidebar:
     sheet_url = st.text_input("Google Sheet URL", DEFAULT_SHEET_URL)
     sheet_name = st.text_input("Worksheet name (optional)", "")
