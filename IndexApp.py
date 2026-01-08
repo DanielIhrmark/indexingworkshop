@@ -331,11 +331,11 @@ with st.sidebar:
     if st.button("Refresh data"):
         st.cache_data.clear()
     if st.button("Test SPARQL endpoint"):
-    try:
-        test = sparql_select_json(sparql_endpoint, "SELECT (1 as ?ok) WHERE {} LIMIT 1")
-        st.success(f"Endpoint OK: {test['results']['bindings']}")
-    except Exception as e:
-        st.error(f"Endpoint test failed: {e}")
+        try:
+            test = sparql_select_json(sparql_endpoint, "SELECT (1 as ?ok) WHERE {} LIMIT 1")
+            st.success(f"Endpoint OK: {test['results']['bindings']}")
+        except Exception as e:
+            st.error(f"Endpoint test failed: {e}")
         
 df = load_sheet_as_df(sheet_url, sheet_name)
 
