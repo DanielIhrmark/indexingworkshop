@@ -17,6 +17,7 @@ BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
 
 SAO_SCHEME_URI = "https://id.kb.se/term/sao"
+KBV = "https://id.kb.se/vocab/"
 
 
 # -----------------------------
@@ -92,37 +93,41 @@ def sparql_select_json(endpoint: str, sparql: str) -> dict:
 
 
 # -----------------------------
-# SAO matching + expansion (GRAPH ?g)
+# SAO: lookup + context (IMPORTANT: uses :mainEntity pattern)
 # -----------------------------
 @st.cache_data(ttl=3600)
 def sao_lookup_candidates(endpoint: str, token: str, mode: str, limit: int) -> List[Tuple[str, str]]:
     """
-    Return list of (term_uri, label) candidates for token by:
-      mode = "exact" | "starts" | "contains"
-    Searches within GRAPH ?g to ensure we see named-graph data.
+    Returns list of (term_uri, prefLabel) for SAO topics.
+
+    Critical: uses Libris XL metadata pattern:
+        ?meta :mainEntity ?term .
+        ?term :inScheme <...> ; :prefLabel ?label .
+
+    mode: exact | starts | contains
     """
     token = (token or "").strip()
     if len(token) < 2:
         return []
 
     safe = token.replace('"', '\\"')
+
     if mode == "exact":
         label_filter = f'FILTER(LCASE(STR(?label)) = LCASE("{safe}"))'
     elif mode == "starts":
         label_filter = f'FILTER(STRSTARTS(LCASE(STR(?label)), LCASE("{safe}")))'
-    else:  # contains
+    else:
         label_filter = f'FILTER regex(str(?label), "{re.escape(token)}", "i")'
 
     sparql = f"""
-    PREFIX : <https://id.kb.se/vocab/>
+    PREFIX : <{KBV}>
 
     SELECT DISTINCT ?term ?label WHERE {{
-      GRAPH ?g {{
-        ?term :inScheme <{SAO_SCHEME_URI}> ;
-              :prefLabel ?label .
-        FILTER(lang(?label) = "sv")
-        {label_filter}
-      }}
+      ?meta :mainEntity ?term .
+      ?term :inScheme <{SAO_SCHEME_URI}> ;
+            :prefLabel ?label .
+      FILTER(lang(?label) = "sv")
+      {label_filter}
     }}
     LIMIT {int(limit)}
     """
@@ -137,22 +142,18 @@ def sao_lookup_candidates(endpoint: str, token: str, mode: str, limit: int) -> L
 @st.cache_data(ttl=3600)
 def sao_lookup_best_term(endpoint: str, token: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Return (term_uri, prefLabel) for a best SAO match.
-    Strategy: exact -> starts-with -> contains; pick shortest label.
+    Strategy: exact -> starts-with -> contains; choose shortest label as heuristic.
     """
-    # 1) exact
     cands = sao_lookup_candidates(endpoint, token, mode="exact", limit=20)
     if cands:
         return cands[0][0], cands[0][1]
 
-    # 2) starts-with
-    cands = sao_lookup_candidates(endpoint, token, mode="starts", limit=100)
+    cands = sao_lookup_candidates(endpoint, token, mode="starts", limit=200)
     if cands:
         best = sorted(cands, key=lambda x: len(x[1]))[0]
         return best[0], best[1]
 
-    # 3) contains
-    cands = sao_lookup_candidates(endpoint, token, mode="contains", limit=200)
+    cands = sao_lookup_candidates(endpoint, token, mode="contains", limit=400)
     if cands:
         best = sorted(cands, key=lambda x: len(x[1]))[0]
         return best[0], best[1]
@@ -163,43 +164,38 @@ def sao_lookup_best_term(endpoint: str, token: str) -> Tuple[Optional[str], Opti
 @st.cache_data(ttl=3600)
 def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
     """
-    Fetch raw related labels as phrases (altLabel, broader, narrower).
-    Narrower is inferred via inverse :broader in GRAPH ?g.
+    Returns raw phrase labels for:
+      - altLabel
+      - broader prefLabel
+      - narrower prefLabel (inverse broader)
     """
     sparql = f"""
-    PREFIX : <https://id.kb.se/vocab/>
+    PREFIX : <{KBV}>
 
     SELECT DISTINCT ?p ?oLabel WHERE {{
       VALUES ?term {{ <{term_uri}> }}
 
-      GRAPH ?g {{
-
-        # broader
-        {{
-          ?term :broader ?o .
-          ?o :prefLabel ?oLabel .
-          FILTER(lang(?oLabel) = "sv")
-          BIND("broader" AS ?p)
-        }}
-
-        UNION
-
-        # narrower (inverse broader)
-        {{
-          ?n :broader ?term .
-          ?n :prefLabel ?oLabel .
-          FILTER(lang(?oLabel) = "sv")
-          BIND("narrower" AS ?p)
-        }}
-
-        UNION
-
-        # altLabel
-        {{
-          ?term :altLabel ?oLabel .
-          FILTER(lang(?oLabel) = "sv")
-          BIND("altLabel" AS ?p)
-        }}
+      # altLabel
+      {{
+        ?term :altLabel ?oLabel .
+        FILTER(lang(?oLabel) = "sv")
+        BIND("altLabel" AS ?p)
+      }}
+      UNION
+      # broader
+      {{
+        ?term :broader ?o .
+        ?o :prefLabel ?oLabel .
+        FILTER(lang(?oLabel) = "sv")
+        BIND("broader" AS ?p)
+      }}
+      UNION
+      # narrower (inverse broader)
+      {{
+        ?n :broader ?term .
+        ?n :prefLabel ?oLabel .
+        FILTER(lang(?oLabel) = "sv")
+        BIND("narrower" AS ?p)
       }}
     }}
     """
@@ -215,7 +211,6 @@ def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
 
     for k in ctx:
         ctx[k] = sorted(list(dict.fromkeys(ctx[k])), key=str.lower)
-
     return ctx
 
 
@@ -226,10 +221,9 @@ def expand_token_tokens(
 ) -> Tuple[List[str], Dict[str, List[str]], Optional[str], Optional[str]]:
     """
     Returns:
-      - expansion tokens (single words) for local retrieval
-      - raw context labels (phrases) for debugging
-      - matched SAO URI
-      - matched SAO prefLabel
+      - expansion tokens (single words) used for local retrieval
+      - raw context labels (phrases)
+      - matched SAO URI + prefLabel
     """
     term_uri, term_label = sao_lookup_best_term(endpoint, token)
     if not term_uri:
@@ -268,13 +262,6 @@ def search_with_expansion(
     expand: bool,
     include_hierarchy: bool,
 ) -> Tuple[set, List[List[str]], List[str], List[Dict]]:
-    """
-    Returns:
-      - ids (set)
-      - groups (OR-groups used for retrieval)
-      - errors (list)
-      - debug (raw SAO labels + matched URI/prefLabel per token)
-    """
     base_tokens = tokenize(query)
     if not base_tokens:
         return set(), [], [], []
