@@ -80,39 +80,8 @@ def simple_search(inv: Dict[str, set], query: str) -> Tuple[set, List[str]]:
 
 
 # -----------------------------
-# SAO SPARQL helpers
+# SAO SPARQL helpers (for expansion)
 # -----------------------------
-@st.cache_data(ttl=3600)
-def sao_autocomplete(endpoint: str, q: str, limit: int = 20) -> List[Tuple[str, str]]:
-    q = (q or "").strip()
-    if len(q) < 2:
-        return []
-
-    sparql = f"""
-    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-    SELECT ?term ?label WHERE {{
-      ?term skos:inScheme <https://id.kb.se/term/sao> ;
-            skos:prefLabel ?label .
-      FILTER(lang(?label) = "sv")
-      FILTER regex(str(?label), "{re.escape(q)}", "i")
-    }}
-    ORDER BY LCASE(STR(?label))
-    LIMIT {limit}
-    """
-
-    r = requests.get(
-        endpoint,
-        params={"query": sparql, "format": "json"},
-        headers={"Accept": "application/sparql-results+json"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()
-
-    return [(b["label"]["value"], b["term"]["value"])
-            for b in data["results"]["bindings"]]
-
-
 @st.cache_data(ttl=3600)
 def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
     sparql = f"""
@@ -151,30 +120,36 @@ def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
     data = r.json()
 
     ctx = {"broader": [], "narrower": [], "altLabel": []}
-    for b in data["results"]["bindings"]:
-        ctx[b["p"]["value"]].append(b["oLabel"]["value"])
+    for b in data.get("results", {}).get("bindings", []):
+        p = b["p"]["value"]
+        lbl = b["oLabel"]["value"]
+        if p in ctx:
+            ctx[p].append(lbl)
 
     for k in ctx:
         ctx[k] = sorted(set(ctx[k]), key=str.lower)
     return ctx
 
 
-# -----------------------------
-# SAO query expansion
-# -----------------------------
 @st.cache_data(ttl=3600)
 def sao_lookup_by_pref_label(endpoint: str, label: str) -> Optional[str]:
-    label = label.replace('"', '\\"')
+    label = (label or "").strip()
+    if len(label) < 2:
+        return None
+
+    safe = label.replace('"', '\\"')
+
     sparql = f"""
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
     SELECT ?term WHERE {{
       ?term skos:inScheme <https://id.kb.se/term/sao> ;
             skos:prefLabel ?label .
       FILTER(lang(?label)="sv")
-      FILTER(LCASE(STR(?label)) = LCASE("{label}"))
+      FILTER(LCASE(STR(?label)) = LCASE("{safe}"))
     }}
     LIMIT 1
     """
+
     r = requests.get(
         endpoint,
         params={"query": sparql, "format": "json"},
@@ -182,7 +157,7 @@ def sao_lookup_by_pref_label(endpoint: str, label: str) -> Optional[str]:
         timeout=20,
     )
     r.raise_for_status()
-    bindings = r.json()["results"]["bindings"]
+    bindings = r.json().get("results", {}).get("bindings", [])
     return bindings[0]["term"]["value"] if bindings else None
 
 
@@ -192,33 +167,54 @@ def expand_token(endpoint: str, token: str, include_hierarchy: bool) -> List[str
         return []
 
     ctx = sao_term_context(endpoint, uri)
-    labels = ctx["altLabel"]
+    labels = list(ctx.get("altLabel", []))
     if include_hierarchy:
-        labels += ctx["broader"] + ctx["narrower"]
+        labels += ctx.get("broader", []) + ctx.get("narrower", [])
 
-    out = []
+    out: List[str] = []
     seen = set()
+
     for lbl in labels:
         for t in tokenize(lbl):
-            if t != token and t not in seen:
-                seen.add(t)
-                out.append(t)
+            if t == token:
+                continue
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+
     return out
 
 
-def search_with_expansion(inv, query, endpoint, expand, include_hierarchy):
+def search_with_expansion(
+    inv: Dict[str, set],
+    query: str,
+    endpoint: str,
+    expand: bool,
+    include_hierarchy: bool,
+) -> Tuple[set, List[List[str]]]:
     base_tokens = tokenize(query)
     if not base_tokens:
         return set(), []
 
-    groups = []
+    groups: List[List[str]] = []
     for tok in base_tokens:
         g = [tok]
         if expand:
-            g += expand_token(endpoint, tok, include_hierarchy)
-        groups.append(g)
+            try:
+                g += expand_token(endpoint, tok, include_hierarchy)
+            except Exception:
+                pass
+        # de-dup within group
+        deduped = []
+        seen = set()
+        for t in g:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        groups.append(deduped)
 
-    sets = []
+    sets: List[set] = []
     for g in groups:
         s = set()
         for t in g:
@@ -238,56 +234,52 @@ with st.sidebar:
     sheet_url = st.text_input("Google Sheet URL", DEFAULT_SHEET_URL)
     sheet_name = st.text_input("Worksheet name (optional)", "")
     sparql_endpoint = st.text_input("SPARQL endpoint", DEFAULT_SPARQL_ENDPOINT)
+
     if st.button("Refresh data"):
         st.cache_data.clear()
 
 df = load_sheet_as_df(sheet_url, sheet_name)
 
-id_col = st.selectbox("ID column", options=df.columns)
+if df.empty:
+    st.warning("The sheet loaded, but it appears to be empty.")
+    st.stop()
+
+id_col = st.selectbox("ID column", options=list(df.columns))
 
 available_baseline = [f for f in BASELINE_FIELDS if f in df.columns]
 available_index = [f for f in INDEX_FIELDS if f in df.columns]
 
 query = st.text_input("Query")
 
-expand_query = st.checkbox("Expand query using Svenska Ämnesord (SAO)")
+expand_query = st.checkbox("Expand query using Svenska Ämnesord (SAO)", value=False)
 include_hierarchy = st.checkbox("Include broader/narrower terms", value=True)
 
-mode = st.radio(
-    "Search mode",
-    ["Baseline", "Enriched"],
-    horizontal=True,
-)
+mode = st.radio("Search mode", ["Baseline", "Enriched"], horizontal=True)
 
-fields = available_baseline if mode == "Baseline" else list(set(available_baseline + available_index))
+if mode == "Baseline":
+    default_fields = available_baseline if available_baseline else list(df.columns)[:3]
+    fields = st.multiselect("Fields searched", options=list(df.columns), default=default_fields)
+else:
+    default_fields = list(dict.fromkeys(available_baseline + available_index))
+    if not default_fields:
+        default_fields = list(df.columns)[:6]
+    fields = st.multiselect("Fields searched", options=list(df.columns), default=default_fields)
 
 inv = build_inverted_index(df, fields, id_col)
 
-ids, groups = search_with_expansion(
-    inv,
-    query,
-    sparql_endpoint,
-    expand_query,
-    include_hierarchy,
-)
+ids, groups = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy)
 
-if query:
+if query.strip():
     if ids:
-        res = df[df[id_col].astype(str).isin(ids)]
+        res = df[df[id_col].astype(str).isin(ids)].copy()
         st.success(f"{len(res)} results")
-        st.dataframe(res, use_container_width=True)
+        st.dataframe(res, use_container_width=True, hide_index=True)
+
         if expand_query:
             with st.expander("Query expansion"):
                 for i, g in enumerate(groups, 1):
                     st.write(f"Concept {i}: " + " OR ".join(g))
     else:
         st.warning("No results")
-
-st.divider()
-st.subheader("SAO lookup")
-
-sao_q = st.text_input("Search SAO")
-if sao_q:
-    for lbl, uri in sao_autocomplete(sparql_endpoint, sao_q):
-        st.write(lbl)
-        st.code(uri)
+else:
+    st.info("Enter a query to search.")
