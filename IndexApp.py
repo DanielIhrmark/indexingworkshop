@@ -17,7 +17,7 @@ DEFAULT_SPARQL_ENDPOINT = "https://libris.kb.se/sparql"
 BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
 
-# IMPORTANT: tolerate BOTH SAO scheme URI variants (slash/no-slash)
+# Accept BOTH SAO scheme URI variants (slash/no-slash)
 SAO_SCHEME_URIS = [
     "https://id.kb.se/term/sao/",
     "https://id.kb.se/term/sao",
@@ -30,15 +30,7 @@ SPARQL_BACKOFF_SECONDS = 1
 
 LABEL_CANDIDATE_LIMIT = 20
 SAO_FILTER_LIMIT = 50
-ALTLABEL_LIMIT = 50
-
-# Optional offline fallback (extend as needed for workshop stability)
-FALLBACK_EXPANSIONS = {
-    "klimat": ["klimatförändring", "global uppvärmning", "växthuseffekt", "miljö"],
-    "politik": ["politiska partier", "ideologi", "demokrati", "förvaltning"],
-    "energi": ["energipolitik", "energiförsörjning", "förnybar energi"],
-    "migration": ["invandring", "asylpolitik", "integration"],
-}
+VARIANT_LIMIT = 50
 
 
 # -----------------------------
@@ -122,7 +114,7 @@ def sparql_select_json(endpoint: str, sparql: str) -> dict:
 
 
 # -----------------------------
-# SAO: minimal SPARQL (altLabels only)
+# SAO: label candidate search + filtering to SAO
 # -----------------------------
 @st.cache_data(ttl=3600)
 def label_search_candidates(
@@ -144,7 +136,7 @@ def label_search_candidates(
     else:
         label_filter = f'FILTER regex(str(?label), "{re.escape(token)}", "i")'
 
-    # NOTE: allow lang("sv") OR untagged (lang="") to reduce false negatives
+    # allow lang("sv") OR untagged (lang="")
     sparql = f"""
     PREFIX kbv: <https://id.kb.se/vocab/>
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -177,9 +169,6 @@ def label_search_candidates(
 
 @st.cache_data(ttl=3600)
 def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT) -> List[str]:
-    """
-    Filters a list of URIs to those that are in SAO, tolerating both scheme variants.
-    """
     if not uris:
         return []
     uris = uris[:100]
@@ -215,15 +204,13 @@ def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT)
 @st.cache_data(ttl=3600)
 def try_direct_sao_uri(endpoint: str, token: str) -> Optional[str]:
     """
-    Direct-URI fast path:
-    If the concept exists at https://id.kb.se/term/sao/<Token> (case sensitive),
-    confirm it is in SAO and return the URI.
+    Direct-URI fast path: confirm that https://id.kb.se/term/sao/<Token> exists in SAO.
+    This is important because SAO URIs are often case-sensitive (e.g., .../Fyrhjulingar).
     """
     token = (token or "").strip()
     if not token:
         return None
 
-    # Try as-is and TitleCase first char
     candidates = []
     candidates.append(f"https://id.kb.se/term/sao/{urllib.parse.quote(token)}")
     if token[0].isalpha():
@@ -244,61 +231,20 @@ def try_direct_sao_uri(endpoint: str, token: str) -> Optional[str]:
         """
         data = sparql_select_json(endpoint, sparql)
         bindings = data.get("results", {}).get("bindings", [])
-        if bindings:
-            n = int(bindings[0]["n"]["value"])
-            if n > 0:
-                return uri
+        if bindings and int(bindings[0]["n"]["value"]) > 0:
+            return uri
 
     return None
-
-
-@st.cache_data(ttl=3600)
-def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> List[str]:
-    """
-    Fetch Swedish altLabels (kbv:altLabel and skos:altLabel). Allow untagged too.
-    """
-    sparql = f"""
-    PREFIX kbv: <https://id.kb.se/vocab/>
-    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-
-    SELECT DISTINCT ?alt WHERE {{
-      VALUES ?term {{ <{term_uri}> }}
-      {{
-        ?term kbv:altLabel ?alt .
-        FILTER(lang(?alt)="sv" || lang(?alt)="")
-      }}
-      UNION
-      {{
-        ?term skos:altLabel ?alt .
-        FILTER(lang(?alt)="sv" || lang(?alt)="")
-      }}
-    }}
-    LIMIT {int(limit)}
-    """
-    data = sparql_select_json(endpoint, sparql)
-    alts = [b["alt"]["value"] for b in data.get("results", {}).get("bindings", [])]
-    # de-dup case-insensitive
-    seen = set()
-    out = []
-    for a in alts:
-        k = a.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(a)
-    return out
 
 
 def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], List[Tuple[str, str]], List[str], str]:
     """
     Returns (best_uri, label_candidates, sao_uris, lookup_token_used).
-    Includes a direct URI fast-path to catch known SAO URIs like .../Fyrhjulingar.
     """
-    # 0) Fast path: if token maps directly to a known SAO URI
     direct = try_direct_sao_uri(endpoint, token)
     if direct:
         return direct, [], [direct], token
 
-    # 1) Fall back to label lookup
     cands = label_search_candidates(endpoint, token, mode="exact")
     if not cands:
         cands = label_search_candidates(endpoint, token, mode="starts")
@@ -317,28 +263,111 @@ def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], Li
 
 
 # -----------------------------
-# Expansion: altLabels only + explicit run + session cache + fallback
+# SAO "variant" fetch (what the UI shows as "variant")
+# -----------------------------
+@st.cache_data(ttl=3600)
+def sao_variants(endpoint: str, term_uri: str, limit: int = VARIANT_LIMIT) -> List[str]:
+    """
+    Fetch the SAO 'variant' labels.
+    On id.kb.se, 'variant' is shown separately from altLabel. :contentReference[oaicite:1]{index=1}
+
+    We query a small set of plausible predicates used in Libris/KB vocab data.
+    This is intentionally permissive to avoid false negatives across modeling differences.
+    """
+    sparql = f"""
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+    SELECT DISTINCT ?v WHERE {{
+      VALUES ?term {{ <{term_uri}> }}
+
+      {{
+        ?term kbv:variant ?v .
+        FILTER(isLiteral(?v))
+        FILTER(lang(?v)="sv" || lang(?v)="")
+      }}
+      UNION
+      {{
+        ?term kbv:variantLabel ?v .
+        FILTER(isLiteral(?v))
+        FILTER(lang(?v)="sv" || lang(?v)="")
+      }}
+      UNION
+      {{
+        # Some KB data models variant-like strings as hidden labels
+        ?term kbv:hiddenLabel ?v .
+        FILTER(lang(?v)="sv" || lang(?v)="")
+      }}
+      UNION
+      {{
+        ?term skos:hiddenLabel ?v .
+        FILTER(lang(?v)="sv" || lang(?v)="")
+      }}
+    }}
+    LIMIT {int(limit)}
+    """
+    data = sparql_select_json(endpoint, sparql)
+    vals = [b["v"]["value"] for b in data.get("results", {}).get("bindings", [])]
+
+    # de-dup case-insensitive
+    seen = set()
+    out = []
+    for s in vals:
+        k = s.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(s)
+    return out
+
+
+@st.cache_data(ttl=3600)
+def sao_preflabel(endpoint: str, term_uri: str) -> Optional[str]:
+    sparql = f"""
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+    SELECT DISTINCT ?lbl WHERE {{
+      VALUES ?term {{ <{term_uri}> }}
+      {{
+        ?term kbv:prefLabel ?lbl .
+      }}
+      UNION
+      {{
+        ?term skos:prefLabel ?lbl .
+      }}
+      FILTER(lang(?lbl)="sv" || lang(?lbl)="")
+    }}
+    LIMIT 1
+    """
+    data = sparql_select_json(endpoint, sparql)
+    bindings = data.get("results", {}).get("bindings", [])
+    return bindings[0]["lbl"]["value"] if bindings else None
+
+
+# -----------------------------
+# Expansion: variants-only + explicit run + session cache
 # -----------------------------
 def ensure_state():
     if "sao_cache" not in st.session_state:
-        st.session_state["sao_cache"] = {}  # token -> payload
+        st.session_state["sao_cache"] = {}
     if "enable_sao" not in st.session_state:
         st.session_state["enable_sao"] = False
     if "run_sao_now" not in st.session_state:
         st.session_state["run_sao_now"] = False
 
 
-def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
+def compute_variant_expansion(endpoint: str, token: str) -> Dict:
     payload = {
         "token": token,
         "lookup_token_used": token,
         "source": "None",
         "best_sao_uri": None,
+        "prefLabel": None,
         "candidate_count": 0,
         "candidate_preview": [],
         "sao_uri_count": 0,
         "sao_uri_preview": [],
-        "altLabel": [],
+        "variants": [],
         "expansion_tokens": [],
         "error": None,
     }
@@ -346,7 +375,6 @@ def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
     try:
         best_uri, candidates, sao_uris, tok_used = best_sao_uri_for_token(endpoint, token)
         payload["lookup_token_used"] = tok_used
-
         payload["best_sao_uri"] = best_uri
         payload["candidate_count"] = len(candidates)
         payload["candidate_preview"] = [(lbl, uri) for (uri, lbl) in candidates[:8]]
@@ -354,38 +382,24 @@ def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
         payload["sao_uri_preview"] = sao_uris[:8]
 
         if best_uri:
-            alts = sao_altlabels(endpoint, best_uri, limit=ALTLABEL_LIMIT)
-            payload["altLabel"] = alts
+            payload["prefLabel"] = sao_preflabel(endpoint, best_uri)
+            vars_ = sao_variants(endpoint, best_uri, limit=VARIANT_LIMIT)
+            payload["variants"] = vars_
 
-            # expansion tokens derived from altLabels
             toks = []
             seen = set([token.lower()])
-            for ph in alts:
+            for ph in vars_:
                 for t in tokenize(ph):
                     if t not in seen:
                         seen.add(t)
                         toks.append(t)
 
             payload["expansion_tokens"] = toks
-            payload["source"] = "SAO (live, altLabels)"
+            payload["source"] = "SAO (live, variants)"
             return payload
 
     except Exception as e:
         payload["error"] = str(e)
-
-    # Optional fallback if live fails
-    tkey = token.lower()
-    if tkey in FALLBACK_EXPANSIONS:
-        payload["source"] = "Fallback (offline)"
-        payload["altLabel"] = FALLBACK_EXPANSIONS[tkey]
-        toks = []
-        seen = set([tkey])
-        for ph in payload["altLabel"]:
-            for t in tokenize(ph):
-                if t not in seen:
-                    seen.add(t)
-                    toks.append(t)
-        payload["expansion_tokens"] = toks
 
     return payload
 
@@ -403,21 +417,20 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
         dbg = {
             "token": tok,
             "lookup_token_used": tok,
-            "source": "Not run (click 'Run SAO altLabel expansion now')",
+            "source": "Not run (click 'Run SAO variant expansion now')",
             "best_sao_uri": None,
+            "prefLabel": None,
             "candidate_preview": [],
-            "sao_uri_preview": [],
-            "altLabel": [],
+            "variants": [],
             "expansion_tokens": [],
             "error": None,
         }
 
         if expand_enabled:
-            # Only compute when button pressed; otherwise use cache if present
             if run_expansion_now or tok in st.session_state["sao_cache"]:
                 try:
                     if run_expansion_now or tok not in st.session_state["sao_cache"]:
-                        st.session_state["sao_cache"][tok] = compute_altlabel_expansion(endpoint, tok)
+                        st.session_state["sao_cache"][tok] = compute_variant_expansion(endpoint, tok)
                     dbg = st.session_state["sao_cache"][tok]
                     g += dbg.get("expansion_tokens", [])
                     if dbg.get("error"):
@@ -456,7 +469,6 @@ st.title("Indexing Lab")
 
 ensure_state()
 
-# define variables at top level (avoid NameError on reruns)
 sheet_url = DEFAULT_SHEET_URL
 sheet_name = ""
 sparql_endpoint = DEFAULT_SPARQL_ENDPOINT
@@ -489,13 +501,13 @@ available_index = [f for f in INDEX_FIELDS if f in df.columns]
 query = st.text_input("Query")
 
 expand_query = st.checkbox(
-    "Enable SAO altLabel expansion (SPARQL)",
+    "Enable SAO variant expansion (SPARQL)",
     value=st.session_state["enable_sao"],
     key="enable_sao",
 )
 
 if expand_query:
-    if st.button("Run SAO altLabel expansion now", key="run_sao_btn"):
+    if st.button("Run SAO variant expansion now", key="run_sao_btn"):
         st.session_state["run_sao_now"] = True
 else:
     st.session_state["run_sao_now"] = False
@@ -521,16 +533,16 @@ ids, groups, errors, debug = search_with_expansion(
     run_expansion_now=st.session_state["run_sao_now"],
 )
 
-# reset one-shot flag after use
+# reset one-shot flag
 st.session_state["run_sao_now"] = False
 
 if query.strip():
     if expand_query:
-        with st.expander("SAO matches and altLabels (debug)", expanded=True):
+        with st.expander("Query expansion (debug)", expanded=True):
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
-            st.markdown("#### Expansion status per token (altLabels only)")
+            st.markdown("#### SAO resolution + variants (what SAO calls “variant”)")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
                 st.write("Source:", item.get("source", "—"))
@@ -542,24 +554,16 @@ if query.strip():
                 else:
                     st.write("Matched SAO URI: —")
 
-                if item.get("candidate_preview"):
-                    st.write("Label candidates (preview):")
-                    for lbl, uri in item["candidate_preview"]:
-                        st.write(f"- {lbl}")
-                else:
-                    st.write("Label candidates (preview): —")
+                st.write("prefLabel:", item.get("prefLabel", "—"))
 
-                alts = item.get("altLabel", [])
-                st.write("altLabel:", ", ".join(alts) if alts else "—")
+                vars_ = item.get("variants", [])
+                st.write("variants:", ", ".join(vars_) if vars_ else "—")
                 st.divider()
 
             if errors:
-                st.warning(
-                    "Some live SAO lookups timed out or failed. Fallback expansions may be shown where available.\n\n"
-                    + "\n".join(errors)
-                )
+                st.warning("\n".join(errors))
             else:
-                st.caption("Tip: On Community Cloud, click 'Run SAO altLabel expansion now' only after you finish typing your query.")
+                st.caption("Tip: Click 'Run SAO variant expansion now' after typing. Results are cached per session.")
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
