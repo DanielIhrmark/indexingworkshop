@@ -32,6 +32,10 @@ LABEL_CANDIDATE_LIMIT = 20
 SAO_FILTER_LIMIT = 50
 VARIANT_LIMIT = 50
 
+# Heuristics for “variant-like” strings
+MAX_VARIANT_LEN = 60  # keep variants short
+MIN_VARIANT_LEN = 2
+
 
 # -----------------------------
 # Google Sheet helpers
@@ -136,7 +140,6 @@ def label_search_candidates(
     else:
         label_filter = f'FILTER regex(str(?label), "{re.escape(token)}", "i")'
 
-    # allow lang("sv") OR untagged (lang="")
     sparql = f"""
     PREFIX kbv: <https://id.kb.se/vocab/>
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -203,9 +206,6 @@ def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT)
 
 @st.cache_data(ttl=3600)
 def try_direct_sao_uri(endpoint: str, token: str) -> Optional[str]:
-    """
-    Direct-URI fast path: confirm that https://id.kb.se/term/sao/<Token> exists in SAO.
-    """
     token = (token or "").strip()
     if not token:
         return None
@@ -237,9 +237,6 @@ def try_direct_sao_uri(endpoint: str, token: str) -> Optional[str]:
 
 
 def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], List[Tuple[str, str]], List[str], str]:
-    """
-    Returns (best_uri, label_candidates, sao_uris, lookup_token_used).
-    """
     direct = try_direct_sao_uri(endpoint, token)
     if direct:
         return direct, [], [direct], token
@@ -262,7 +259,7 @@ def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], Li
 
 
 # -----------------------------
-# SAO prefLabel + variant-like literals via introspection
+# SAO prefLabel + variants via depth-2 literal harvesting
 # -----------------------------
 @st.cache_data(ttl=3600)
 def sao_preflabel(endpoint: str, term_uri: str) -> Optional[str]:
@@ -289,83 +286,102 @@ def sao_preflabel(endpoint: str, term_uri: str) -> Optional[str]:
 
 
 @st.cache_data(ttl=3600)
-def sao_literal_properties(endpoint: str, term_uri: str, limit: int = 200) -> List[Tuple[str, str]]:
+def sao_variant_literals_depth2(endpoint: str, term_uri: str, limit: int = 300) -> List[Tuple[str, str]]:
     """
-    Pull ALL literal properties for a term (sv or untagged) so we can discover where SAO stores “variant”.
-    Returns list of (predicate_uri, literal_value).
+    Harvest literal strings at depth 1 and depth 2:
+      - <term> ?p ?lit
+      - <term> ?p ?node . ?node ?p2 ?lit
+    Return (predicate_path, literal_value) where predicate_path is either ?p or ?p/?p2.
     """
     sparql = f"""
-    SELECT DISTINCT ?p ?v WHERE {{
+    SELECT DISTINCT ?p ?p2 ?v WHERE {{
       VALUES ?term {{ <{term_uri}> }}
-      ?term ?p ?v .
-      FILTER(isLiteral(?v))
-      FILTER(lang(?v)="sv" || lang(?v)="")
+
+      {{
+        ?term ?p ?v .
+        FILTER(isLiteral(?v))
+        FILTER(lang(?v)="sv" || lang(?v)="")
+        BIND("" AS ?p2)
+      }}
+      UNION
+      {{
+        ?term ?p ?node .
+        FILTER(isIRI(?node) || isBlank(?node))
+        ?node ?p2 ?v .
+        FILTER(isLiteral(?v))
+        FILTER(lang(?v)="sv" || lang(?v)="")
+      }}
     }}
     LIMIT {int(limit)}
     """
     data = sparql_select_json(endpoint, sparql)
-    out = []
+    out: List[Tuple[str, str]] = []
     for b in data.get("results", {}).get("bindings", []):
-        out.append((b["p"]["value"], b["v"]["value"]))
+        p = b["p"]["value"]
+        p2 = b.get("p2", {}).get("value", "")
+        v = b["v"]["value"]
+        path = p if not p2 else f"{p} / {p2}"
+        out.append((path, v))
     return out
 
 
-def _local_name(uri: str) -> str:
-    if "#" in uri:
-        return uri.rsplit("#", 1)[-1]
-    return uri.rstrip("/").rsplit("/", 1)[-1]
+def _looks_like_noise(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return True
+    if len(s) < MIN_VARIANT_LEN or len(s) > MAX_VARIANT_LEN:
+        return True
+    # drop numeric classification-like strings
+    if re.fullmatch(r"[0-9.]+", s):
+        return True
+    # drop very sentence-like strings (notes)
+    if s.count(" ") >= 6:
+        return True
+    return False
 
 
 @st.cache_data(ttl=3600)
 def sao_variants(endpoint: str, term_uri: str, limit: int = VARIANT_LIMIT) -> Tuple[List[str], List[Tuple[str, str]]]:
     """
-    Returns (variants, evidence_pairs) where evidence_pairs are (predicate_uri, literal_value).
-
-    Strategy:
-    1) Fetch all literal properties for the term.
-    2) Exclude prefLabel and “note/definition”-like properties.
-    3) Prefer predicates whose local-name contains 'variant' or equals hiddenLabel.
-    4) If none found, fall back to the remaining literals (after exclusions).
+    Return variants (strings) + evidence (predicate-path, value).
+    This works even when “variant” is modeled via an intermediate node.
     """
-    pref = sao_preflabel(endpoint, term_uri) or ""
-    pairs = sao_literal_properties(endpoint, term_uri)
+    pref = (sao_preflabel(endpoint, term_uri) or "").strip()
+    pairs = sao_variant_literals_depth2(endpoint, term_uri)
 
-    # Exclude prefLabel-like values and note-like predicates
-    EXCLUDE_PRED_LOCAL = {
-        "prefLabel", "label", "name",
-        "scopeNote", "note", "definition", "editorialNote", "historyNote", "changeNote",
-        "comment", "description",
-    }
-
-    filtered = []
-    for p, v in pairs:
-        if v.strip() == pref.strip():
+    # Keep candidate strings that are short and not the prefLabel itself
+    candidates: List[Tuple[str, str]] = []
+    for path, val in pairs:
+        val_s = (val or "").strip()
+        if not val_s:
             continue
-        pl = _local_name(p)
-        if pl in EXCLUDE_PRED_LOCAL:
+        if val_s == pref:
             continue
-        filtered.append((p, v))
+        if _looks_like_noise(val_s):
+            continue
+        candidates.append((path, val_s))
 
-    # Prefer "variant" / hiddenLabel predicates if present
-    preferred = []
-    for p, v in filtered:
-        pl = _local_name(p).lower()
-        if "variant" in pl or pl in {"hiddenlabel"}:
-            preferred.append((p, v))
+    # Prefer any paths that include "variant" in the predicate name (if present)
+    def score(path_val: Tuple[str, str]) -> Tuple[int, int]:
+        path, val = path_val
+        path_l = path.lower()
+        return (0 if "variant" in path_l else 1, len(val))
 
-    chosen = preferred if preferred else filtered
-    chosen = chosen[:limit]
+    candidates.sort(key=score)
 
-    # de-dup values case-insensitive
+    # De-dup values case-insensitive and cap
     seen = set()
-    variants = []
-    evidence = []
-    for p, v in chosen:
-        k = v.lower()
-        if k not in seen:
-            seen.add(k)
-            variants.append(v)
-            evidence.append((p, v))
+    variants: List[str] = []
+    evidence: List[Tuple[str, str]] = []
+    for path, val in candidates:
+        k = val.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        variants.append(val)
+        evidence.append((path, val))
+        if len(variants) >= limit:
+            break
 
     return variants, evidence
 
@@ -394,7 +410,7 @@ def compute_variant_expansion(endpoint: str, token: str) -> Dict:
         "sao_uri_count": 0,
         "sao_uri_preview": [],
         "variants": [],
-        "variant_evidence": [],  # list of (predicate_uri, value)
+        "variant_evidence": [],
         "expansion_tokens": [],
         "error": None,
     }
@@ -410,21 +426,20 @@ def compute_variant_expansion(endpoint: str, token: str) -> Dict:
 
         if best_uri:
             payload["prefLabel"] = sao_preflabel(endpoint, best_uri)
-
-            variants, evidence = sao_variants(endpoint, best_uri, limit=VARIANT_LIMIT)
-            payload["variants"] = variants
+            vars_, evidence = sao_variants(endpoint, best_uri, limit=VARIANT_LIMIT)
+            payload["variants"] = vars_
             payload["variant_evidence"] = evidence
 
             toks = []
             seen = set([token.lower()])
-            for ph in variants:
+            for ph in vars_:
                 for t in tokenize(ph):
                     if t not in seen:
                         seen.add(t)
                         toks.append(t)
 
             payload["expansion_tokens"] = toks
-            payload["source"] = "SAO (live, variants via literal inspection)"
+            payload["source"] = "SAO (live, variants depth-2)"
             return payload
 
     except Exception as e:
@@ -568,7 +583,7 @@ if query.strip():
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
-            st.markdown("#### SAO resolution + variants (derived from literal properties)")
+            st.markdown("#### SAO resolution + variants (depth-2 harvest)")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
                 st.write("Source:", item.get("source", "—"))
@@ -585,12 +600,11 @@ if query.strip():
                 vars_ = item.get("variants", [])
                 st.write("variants:", ", ".join(vars_) if vars_ else "—")
 
-                # Evidence: which predicate carried which variant string (helps you pin the exact field)
                 evidence = item.get("variant_evidence", [])
                 if evidence:
-                    st.caption("Variant evidence (predicate → value):")
-                    for p, v in evidence:
-                        st.write(f"- {_local_name(p)} ({p}) → {v}")
+                    st.caption("Variant evidence (predicate path → value):")
+                    for p, v in evidence[:10]:
+                        st.write(f"- {p} → {v}")
 
                 st.divider()
 
