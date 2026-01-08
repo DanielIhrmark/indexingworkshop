@@ -136,24 +136,25 @@ def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
             ctx[p].append(lbl)
 
     for k in ctx:
-        ctx[k] = sorted(set(ctx[k]), key=str.lower)
+        # de-dup + stable sort
+        ctx[k] = sorted(list(dict.fromkeys(ctx[k])), key=str.lower)
 
     return ctx
 
 
 @st.cache_data(ttl=3600)
-def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
+def sao_lookup_best_term(endpoint: str, token: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Find a 'best' SAO concept URI for a token.
+    Return (term_uri, prefLabel) for a 'best' SAO concept match.
     Strategy:
-      1) exact prefLabel match
-      2) prefLabel starts-with match
-      3) prefLabel contains match
-    Picks the shortest matching label as a simple heuristic.
+      1) exact prefLabel
+      2) starts-with prefLabel
+      3) contains prefLabel
+    Heuristic: choose the shortest label among candidates.
     """
     token = (token or "").strip()
     if len(token) < 2:
-        return None
+        return None, None
 
     safe = token.replace('"', '\\"')
 
@@ -166,12 +167,12 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
       FILTER(lang(?label) = "sv")
       FILTER(LCASE(STR(?label)) = LCASE("{safe}"))
     }}
-    LIMIT 5
+    LIMIT 10
     """
     data = sparql_select_json(endpoint, sparql_exact)
     bindings = data.get("results", {}).get("bindings", [])
     if bindings:
-        return bindings[0]["term"]["value"]
+        return bindings[0]["term"]["value"], bindings[0]["label"]["value"]
 
     # 2) Starts-with match
     sparql_starts = f"""
@@ -182,16 +183,15 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
       FILTER(lang(?label) = "sv")
       FILTER(STRSTARTS(LCASE(STR(?label)), LCASE("{safe}")))
     }}
-    LIMIT 30
+    LIMIT 50
     """
     data = sparql_select_json(endpoint, sparql_starts)
     bindings = data.get("results", {}).get("bindings", [])
     if bindings:
         best = sorted(bindings, key=lambda b: len(b["label"]["value"]))[0]
-        return best["term"]["value"]
+        return best["term"]["value"], best["label"]["value"]
 
     # 3) Contains match
-    # NOTE: token is interpolated into a regex; escape it.
     sparql_contains = f"""
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
     SELECT ?term ?label WHERE {{
@@ -200,47 +200,52 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
       FILTER(lang(?label) = "sv")
       FILTER regex(str(?label), "{re.escape(token)}", "i")
     }}
-    LIMIT 50
+    LIMIT 100
     """
     data = sparql_select_json(endpoint, sparql_contains)
     bindings = data.get("results", {}).get("bindings", [])
     if not bindings:
-        return None
+        return None, None
 
     best = sorted(bindings, key=lambda b: len(b["label"]["value"]))[0]
-    return best["term"]["value"]
+    return best["term"]["value"], best["label"]["value"]
 
 
-def expand_token(endpoint: str, token: str, include_hierarchy: bool) -> List[str]:
+def expand_token_tokens(endpoint: str, token: str, include_hierarchy: bool) -> Tuple[List[str], Dict[str, List[str]], Optional[str], Optional[str]]:
     """
-    Expand a query token into additional tokens using SAO:
-      - altLabel (equivalence)
-      - broader/narrower (optional)
-    Returns expansion tokens (already tokenized to match the inverted index).
+    For retrieval: returns expansion tokens (tokenized single words).
+    For debug: returns raw context labels and matched URI/label.
     """
-    uri = sao_lookup_best_term_uri(endpoint, token)
-    if not uri:
-        return []
+    term_uri, term_label = sao_lookup_best_term(endpoint, token)
+    if not term_uri:
+        return [], {"altLabel": [], "broader": [], "narrower": []}, None, None
 
-    ctx = sao_term_context(endpoint, uri)
+    ctx = sao_term_context(endpoint, term_uri)
 
-    labels = list(ctx.get("altLabel", []))
+    # Collect raw labels
+    raw_labels = {
+        "altLabel": list(ctx.get("altLabel", [])),
+        "broader": list(ctx.get("broader", [])) if include_hierarchy else [],
+        "narrower": list(ctx.get("narrower", [])) if include_hierarchy else [],
+    }
+
+    # Tokenize labels for matching local inverted index
+    labels_for_tokens = list(raw_labels["altLabel"])
     if include_hierarchy:
-        labels += ctx.get("broader", []) + ctx.get("narrower", [])
+        labels_for_tokens += raw_labels["broader"] + raw_labels["narrower"]
 
-    out: List[str] = []
+    out_tokens: List[str] = []
     seen = set()
-
-    for lbl in labels:
+    for lbl in labels_for_tokens:
         for t in tokenize(lbl):
             if t == token:
                 continue
             if t in seen:
                 continue
             seen.add(t)
-            out.append(t)
+            out_tokens.append(t)
 
-    return out
+    return out_tokens, raw_labels, term_uri, term_label
 
 
 def search_with_expansion(
@@ -249,23 +254,43 @@ def search_with_expansion(
     endpoint: str,
     expand: bool,
     include_hierarchy: bool,
-) -> Tuple[set, List[List[str]], List[str]]:
+) -> Tuple[set, List[List[str]], List[str], List[Dict]]:
     """
-    AND across concepts; OR within each concept's expansions.
-    Returns (matching_ids, groups, errors).
+    Returns:
+      - ids (set)
+      - groups (list of OR-groups for retrieval, as tokens)
+      - errors (list of strings)
+      - debug (list of dicts: raw SAO labels + matched URI per original token)
     """
     base_tokens = tokenize(query)
     if not base_tokens:
-        return set(), [], []
+        return set(), [], [], []
 
     groups: List[List[str]] = []
     errors: List[str] = []
+    debug: List[Dict] = []
 
     for tok in base_tokens:
         g = [tok]
+        dbg_item = {
+            "token": tok,
+            "matched_uri": None,
+            "matched_prefLabel": None,
+            "raw_altLabel": [],
+            "raw_broader": [],
+            "raw_narrower": [],
+        }
+
         if expand:
             try:
-                g += expand_token(endpoint, tok, include_hierarchy)
+                exp_tokens, raw_labels, uri, pref = expand_token_tokens(endpoint, tok, include_hierarchy)
+                g += exp_tokens
+
+                dbg_item["matched_uri"] = uri
+                dbg_item["matched_prefLabel"] = pref
+                dbg_item["raw_altLabel"] = raw_labels.get("altLabel", [])
+                dbg_item["raw_broader"] = raw_labels.get("broader", [])
+                dbg_item["raw_narrower"] = raw_labels.get("narrower", [])
             except Exception as e:
                 errors.append(f"SAO expansion failed for '{tok}': {e}")
 
@@ -278,6 +303,7 @@ def search_with_expansion(
                 deduped.append(t)
 
         groups.append(deduped)
+        debug.append(dbg_item)
 
     # OR within each group
     group_sets: List[set] = []
@@ -289,7 +315,7 @@ def search_with_expansion(
 
     # AND across groups
     ids = set.intersection(*group_sets) if group_sets else set()
-    return ids, groups, errors
+    return ids, groups, errors, debug
 
 
 # -----------------------------
@@ -334,14 +360,38 @@ else:
 
 inv = build_inverted_index(df, fields, id_col)
 
-ids, groups, errors = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy)
+ids, groups, errors, debug = search_with_expansion(
+    inv=inv,
+    query=query,
+    endpoint=sparql_endpoint,
+    expand=expand_query,
+    include_hierarchy=include_hierarchy,
+)
 
 if query.strip():
-    # Always show related terms (expansion) even with 0 hits
+    # Always show expansion + raw SAO relations (debug), even with 0 hits
     if expand_query:
-        with st.expander("Query expansion", expanded=True):
+        with st.expander("Query expansion (debug)", expanded=True):
+            # Token-level OR groups used for retrieval
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
+
+            # Raw SAO relations (phrases) so you can confirm SPARQL returns anything
+            st.markdown("#### SAO matches and raw related terms (phrases)")
+            for item in debug:
+                st.markdown(f"**Token:** `{item['token']}`")
+                if item["matched_uri"]:
+                    st.write("Matched SAO prefLabel:", item["matched_prefLabel"])
+                    st.code(item["matched_uri"])
+                else:
+                    st.write("Matched SAO prefLabel: —")
+                    st.write("Matched SAO URI: —")
+
+                st.write("altLabel:", ", ".join(item["raw_altLabel"]) if item["raw_altLabel"] else "—")
+                st.write("broader:", ", ".join(item["raw_broader"]) if item["raw_broader"] else "—")
+                st.write("narrower:", ", ".join(item["raw_narrower"]) if item["raw_narrower"] else "—")
+                st.divider()
+
             if errors:
                 st.error("\n".join(errors))
 
