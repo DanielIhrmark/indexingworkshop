@@ -270,16 +270,18 @@ inv = build_inverted_index(df, fields, id_col)
 ids, groups = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy)
 
 if query.strip():
+    # Always show expansion if enabled, even when there are no local hits
+    if expand_query:
+        with st.expander("Query expansion", expanded=True):
+            for i, g in enumerate(groups, 1):
+                st.write(f"Concept {i}: " + " OR ".join(g))
+
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
         st.success(f"{len(res)} results")
         st.dataframe(res, use_container_width=True, hide_index=True)
-
-        if expand_query:
-            with st.expander("Query expansion"):
-                for i, g in enumerate(groups, 1):
-                    st.write(f"Concept {i}: " + " OR ".join(g))
     else:
         st.warning("No results")
 else:
     st.info("Enter a query to search.")
+
