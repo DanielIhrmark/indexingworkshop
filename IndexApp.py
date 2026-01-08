@@ -205,7 +205,6 @@ def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT)
 def try_direct_sao_uri(endpoint: str, token: str) -> Optional[str]:
     """
     Direct-URI fast path: confirm that https://id.kb.se/term/sao/<Token> exists in SAO.
-    This is important because SAO URIs are often case-sensitive (e.g., .../Fyrhjulingar).
     """
     token = (token or "").strip()
     if not token:
@@ -263,63 +262,8 @@ def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], Li
 
 
 # -----------------------------
-# SAO "variant" fetch (what the UI shows as "variant")
+# SAO prefLabel + variant-like literals via introspection
 # -----------------------------
-@st.cache_data(ttl=3600)
-def sao_variants(endpoint: str, term_uri: str, limit: int = VARIANT_LIMIT) -> List[str]:
-    """
-    Fetch the SAO 'variant' labels.
-    On id.kb.se, 'variant' is shown separately from altLabel. :contentReference[oaicite:1]{index=1}
-
-    We query a small set of plausible predicates used in Libris/KB vocab data.
-    This is intentionally permissive to avoid false negatives across modeling differences.
-    """
-    sparql = f"""
-    PREFIX kbv: <https://id.kb.se/vocab/>
-    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-
-    SELECT DISTINCT ?v WHERE {{
-      VALUES ?term {{ <{term_uri}> }}
-
-      {{
-        ?term kbv:variant ?v .
-        FILTER(isLiteral(?v))
-        FILTER(lang(?v)="sv" || lang(?v)="")
-      }}
-      UNION
-      {{
-        ?term kbv:variantLabel ?v .
-        FILTER(isLiteral(?v))
-        FILTER(lang(?v)="sv" || lang(?v)="")
-      }}
-      UNION
-      {{
-        # Some KB data models variant-like strings as hidden labels
-        ?term kbv:hiddenLabel ?v .
-        FILTER(lang(?v)="sv" || lang(?v)="")
-      }}
-      UNION
-      {{
-        ?term skos:hiddenLabel ?v .
-        FILTER(lang(?v)="sv" || lang(?v)="")
-      }}
-    }}
-    LIMIT {int(limit)}
-    """
-    data = sparql_select_json(endpoint, sparql)
-    vals = [b["v"]["value"] for b in data.get("results", {}).get("bindings", [])]
-
-    # de-dup case-insensitive
-    seen = set()
-    out = []
-    for s in vals:
-        k = s.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(s)
-    return out
-
-
 @st.cache_data(ttl=3600)
 def sao_preflabel(endpoint: str, term_uri: str) -> Optional[str]:
     sparql = f"""
@@ -342,6 +286,88 @@ def sao_preflabel(endpoint: str, term_uri: str) -> Optional[str]:
     data = sparql_select_json(endpoint, sparql)
     bindings = data.get("results", {}).get("bindings", [])
     return bindings[0]["lbl"]["value"] if bindings else None
+
+
+@st.cache_data(ttl=3600)
+def sao_literal_properties(endpoint: str, term_uri: str, limit: int = 200) -> List[Tuple[str, str]]:
+    """
+    Pull ALL literal properties for a term (sv or untagged) so we can discover where SAO stores “variant”.
+    Returns list of (predicate_uri, literal_value).
+    """
+    sparql = f"""
+    SELECT DISTINCT ?p ?v WHERE {{
+      VALUES ?term {{ <{term_uri}> }}
+      ?term ?p ?v .
+      FILTER(isLiteral(?v))
+      FILTER(lang(?v)="sv" || lang(?v)="")
+    }}
+    LIMIT {int(limit)}
+    """
+    data = sparql_select_json(endpoint, sparql)
+    out = []
+    for b in data.get("results", {}).get("bindings", []):
+        out.append((b["p"]["value"], b["v"]["value"]))
+    return out
+
+
+def _local_name(uri: str) -> str:
+    if "#" in uri:
+        return uri.rsplit("#", 1)[-1]
+    return uri.rstrip("/").rsplit("/", 1)[-1]
+
+
+@st.cache_data(ttl=3600)
+def sao_variants(endpoint: str, term_uri: str, limit: int = VARIANT_LIMIT) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """
+    Returns (variants, evidence_pairs) where evidence_pairs are (predicate_uri, literal_value).
+
+    Strategy:
+    1) Fetch all literal properties for the term.
+    2) Exclude prefLabel and “note/definition”-like properties.
+    3) Prefer predicates whose local-name contains 'variant' or equals hiddenLabel.
+    4) If none found, fall back to the remaining literals (after exclusions).
+    """
+    pref = sao_preflabel(endpoint, term_uri) or ""
+    pairs = sao_literal_properties(endpoint, term_uri)
+
+    # Exclude prefLabel-like values and note-like predicates
+    EXCLUDE_PRED_LOCAL = {
+        "prefLabel", "label", "name",
+        "scopeNote", "note", "definition", "editorialNote", "historyNote", "changeNote",
+        "comment", "description",
+    }
+
+    filtered = []
+    for p, v in pairs:
+        if v.strip() == pref.strip():
+            continue
+        pl = _local_name(p)
+        if pl in EXCLUDE_PRED_LOCAL:
+            continue
+        filtered.append((p, v))
+
+    # Prefer "variant" / hiddenLabel predicates if present
+    preferred = []
+    for p, v in filtered:
+        pl = _local_name(p).lower()
+        if "variant" in pl or pl in {"hiddenlabel"}:
+            preferred.append((p, v))
+
+    chosen = preferred if preferred else filtered
+    chosen = chosen[:limit]
+
+    # de-dup values case-insensitive
+    seen = set()
+    variants = []
+    evidence = []
+    for p, v in chosen:
+        k = v.lower()
+        if k not in seen:
+            seen.add(k)
+            variants.append(v)
+            evidence.append((p, v))
+
+    return variants, evidence
 
 
 # -----------------------------
@@ -368,6 +394,7 @@ def compute_variant_expansion(endpoint: str, token: str) -> Dict:
         "sao_uri_count": 0,
         "sao_uri_preview": [],
         "variants": [],
+        "variant_evidence": [],  # list of (predicate_uri, value)
         "expansion_tokens": [],
         "error": None,
     }
@@ -383,19 +410,21 @@ def compute_variant_expansion(endpoint: str, token: str) -> Dict:
 
         if best_uri:
             payload["prefLabel"] = sao_preflabel(endpoint, best_uri)
-            vars_ = sao_variants(endpoint, best_uri, limit=VARIANT_LIMIT)
-            payload["variants"] = vars_
+
+            variants, evidence = sao_variants(endpoint, best_uri, limit=VARIANT_LIMIT)
+            payload["variants"] = variants
+            payload["variant_evidence"] = evidence
 
             toks = []
             seen = set([token.lower()])
-            for ph in vars_:
+            for ph in variants:
                 for t in tokenize(ph):
                     if t not in seen:
                         seen.add(t)
                         toks.append(t)
 
             payload["expansion_tokens"] = toks
-            payload["source"] = "SAO (live, variants)"
+            payload["source"] = "SAO (live, variants via literal inspection)"
             return payload
 
     except Exception as e:
@@ -420,8 +449,8 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
             "source": "Not run (click 'Run SAO variant expansion now')",
             "best_sao_uri": None,
             "prefLabel": None,
-            "candidate_preview": [],
             "variants": [],
+            "variant_evidence": [],
             "expansion_tokens": [],
             "error": None,
         }
@@ -438,7 +467,6 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
                 except Exception as e:
                     errors.append(f"{tok}: {e}")
 
-        # de-dup group
         deduped = []
         seen = set()
         for t in g:
@@ -449,7 +477,6 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
         groups.append(deduped)
         debug.append(dbg)
 
-    # OR within group, AND across groups
     group_sets = []
     for g in groups:
         s = set()
@@ -533,7 +560,6 @@ ids, groups, errors, debug = search_with_expansion(
     run_expansion_now=st.session_state["run_sao_now"],
 )
 
-# reset one-shot flag
 st.session_state["run_sao_now"] = False
 
 if query.strip():
@@ -542,7 +568,7 @@ if query.strip():
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
-            st.markdown("#### SAO resolution + variants (what SAO calls “variant”)")
+            st.markdown("#### SAO resolution + variants (derived from literal properties)")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
                 st.write("Source:", item.get("source", "—"))
@@ -558,6 +584,14 @@ if query.strip():
 
                 vars_ = item.get("variants", [])
                 st.write("variants:", ", ".join(vars_) if vars_ else "—")
+
+                # Evidence: which predicate carried which variant string (helps you pin the exact field)
+                evidence = item.get("variant_evidence", [])
+                if evidence:
+                    st.caption("Variant evidence (predicate → value):")
+                    for p, v in evidence:
+                        st.write(f"- {_local_name(p)} ({p}) → {v}")
+
                 st.divider()
 
             if errors:
