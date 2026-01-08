@@ -32,7 +32,7 @@ LABEL_CANDIDATE_LIMIT = 20
 SAO_FILTER_LIMIT = 50
 ALTLABEL_LIMIT = 50
 
-# Optional offline fallback
+# Optional offline fallback (extend as needed for workshop stability)
 FALLBACK_EXPANSIONS = {
     "klimat": ["klimatförändring", "global uppvärmning", "växthuseffekt", "miljö"],
     "politik": ["politiska partier", "ideologi", "demokrati", "förvaltning"],
@@ -122,7 +122,7 @@ def sparql_select_json(endpoint: str, sparql: str) -> dict:
 
 
 # -----------------------------
-# SAO matching + altLabels only (SPARQL)
+# SAO: minimal SPARQL (altLabels only)
 # -----------------------------
 @st.cache_data(ttl=3600)
 def label_search_candidates(
@@ -144,6 +144,7 @@ def label_search_candidates(
     else:
         label_filter = f'FILTER regex(str(?label), "{re.escape(token)}", "i")'
 
+    # NOTE: allow lang("sv") OR untagged (lang="") to reduce false negatives
     sparql = f"""
     PREFIX kbv: <https://id.kb.se/vocab/>
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -152,19 +153,19 @@ def label_search_candidates(
     SELECT DISTINCT ?s ?label WHERE {{
       {{
         ?s kbv:prefLabel ?label .
-        FILTER(lang(?label) = "sv")
+        FILTER(lang(?label) = "sv" || lang(?label) = "")
         {label_filter}
       }}
       UNION
       {{
         ?s skos:prefLabel ?label .
-        FILTER(lang(?label) = "sv")
+        FILTER(lang(?label) = "sv" || lang(?label) = "")
         {label_filter}
       }}
       UNION
       {{
         ?s rdfs:label ?label .
-        FILTER(lang(?label) = "sv")
+        FILTER(lang(?label) = "sv" || lang(?label) = "")
         {label_filter}
       }}
     }}
@@ -176,6 +177,9 @@ def label_search_candidates(
 
 @st.cache_data(ttl=3600)
 def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT) -> List[str]:
+    """
+    Filters a list of URIs to those that are in SAO, tolerating both scheme variants.
+    """
     if not uris:
         return []
     uris = uris[:100]
@@ -209,7 +213,50 @@ def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT)
 
 
 @st.cache_data(ttl=3600)
+def try_direct_sao_uri(endpoint: str, token: str) -> Optional[str]:
+    """
+    Direct-URI fast path:
+    If the concept exists at https://id.kb.se/term/sao/<Token> (case sensitive),
+    confirm it is in SAO and return the URI.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+
+    # Try as-is and TitleCase first char
+    candidates = []
+    candidates.append(f"https://id.kb.se/term/sao/{urllib.parse.quote(token)}")
+    if token[0].isalpha():
+        candidates.append(f"https://id.kb.se/term/sao/{urllib.parse.quote(token[0].upper() + token[1:])}")
+
+    schemes = " ".join(f"<{u}>" for u in SAO_SCHEME_URIS)
+
+    for uri in candidates:
+        sparql = f"""
+        PREFIX kbv: <https://id.kb.se/vocab/>
+        PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+        SELECT (COUNT(*) AS ?n) WHERE {{
+          VALUES ?scheme {{ {schemes} }}
+          VALUES ?term {{ <{uri}> }}
+          ?term (kbv:inScheme|skos:inScheme|kbv:inVocabulary) ?scheme .
+        }}
+        """
+        data = sparql_select_json(endpoint, sparql)
+        bindings = data.get("results", {}).get("bindings", [])
+        if bindings:
+            n = int(bindings[0]["n"]["value"])
+            if n > 0:
+                return uri
+
+    return None
+
+
+@st.cache_data(ttl=3600)
 def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> List[str]:
+    """
+    Fetch Swedish altLabels (kbv:altLabel and skos:altLabel). Allow untagged too.
+    """
     sparql = f"""
     PREFIX kbv: <https://id.kb.se/vocab/>
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -218,12 +265,12 @@ def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> 
       VALUES ?term {{ <{term_uri}> }}
       {{
         ?term kbv:altLabel ?alt .
-        FILTER(lang(?alt)="sv")
+        FILTER(lang(?alt)="sv" || lang(?alt)="")
       }}
       UNION
       {{
         ?term skos:altLabel ?alt .
-        FILTER(lang(?alt)="sv")
+        FILTER(lang(?alt)="sv" || lang(?alt)="")
       }}
     }}
     LIMIT {int(limit)}
@@ -241,7 +288,17 @@ def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> 
     return out
 
 
-def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], List[Tuple[str, str]], List[str]]:
+def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], List[Tuple[str, str]], List[str], str]:
+    """
+    Returns (best_uri, label_candidates, sao_uris, lookup_token_used).
+    Includes a direct URI fast-path to catch known SAO URIs like .../Fyrhjulingar.
+    """
+    # 0) Fast path: if token maps directly to a known SAO URI
+    direct = try_direct_sao_uri(endpoint, token)
+    if direct:
+        return direct, [], [direct], token
+
+    # 1) Fall back to label lookup
     cands = label_search_candidates(endpoint, token, mode="exact")
     if not cands:
         cands = label_search_candidates(endpoint, token, mode="starts")
@@ -253,19 +310,18 @@ def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], Li
         sao_set = set(sao_uris)
         sao_cands = [(u, lbl) for (u, lbl) in cands if u in sao_set]
         if sao_cands:
-            # pick shortest label as a crude heuristic
             best = sorted(sao_cands, key=lambda x: len(x[1]))[0]
-            return best[0], cands, sao_uris
+            return best[0], cands, sao_uris, token
 
-    return None, cands, sao_uris
+    return None, cands, sao_uris, token
 
 
 # -----------------------------
-# Expansion: altLabels only + explicit run + session cache + optional fallback
+# Expansion: altLabels only + explicit run + session cache + fallback
 # -----------------------------
 def ensure_state():
     if "sao_cache" not in st.session_state:
-        st.session_state["sao_cache"] = {}
+        st.session_state["sao_cache"] = {}  # token -> payload
     if "enable_sao" not in st.session_state:
         st.session_state["enable_sao"] = False
     if "run_sao_now" not in st.session_state:
@@ -275,6 +331,7 @@ def ensure_state():
 def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
     payload = {
         "token": token,
+        "lookup_token_used": token,
         "source": "None",
         "best_sao_uri": None,
         "candidate_count": 0,
@@ -287,7 +344,9 @@ def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
     }
 
     try:
-        best_uri, candidates, sao_uris = best_sao_uri_for_token(endpoint, token)
+        best_uri, candidates, sao_uris, tok_used = best_sao_uri_for_token(endpoint, token)
+        payload["lookup_token_used"] = tok_used
+
         payload["best_sao_uri"] = best_uri
         payload["candidate_count"] = len(candidates)
         payload["candidate_preview"] = [(lbl, uri) for (uri, lbl) in candidates[:8]]
@@ -298,7 +357,7 @@ def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
             alts = sao_altlabels(endpoint, best_uri, limit=ALTLABEL_LIMIT)
             payload["altLabel"] = alts
 
-            # expansion tokens derived from altLabels (single tokens)
+            # expansion tokens derived from altLabels
             toks = []
             seen = set([token.lower()])
             for ph in alts:
@@ -306,6 +365,7 @@ def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
                     if t not in seen:
                         seen.add(t)
                         toks.append(t)
+
             payload["expansion_tokens"] = toks
             payload["source"] = "SAO (live, altLabels)"
             return payload
@@ -314,19 +374,18 @@ def compute_altlabel_expansion(endpoint: str, token: str) -> Dict:
         payload["error"] = str(e)
 
     # Optional fallback if live fails
-    if token.lower() in FALLBACK_EXPANSIONS:
+    tkey = token.lower()
+    if tkey in FALLBACK_EXPANSIONS:
         payload["source"] = "Fallback (offline)"
-        payload["altLabel"] = FALLBACK_EXPANSIONS[token.lower()]
+        payload["altLabel"] = FALLBACK_EXPANSIONS[tkey]
         toks = []
-        seen = set([token.lower()])
+        seen = set([tkey])
         for ph in payload["altLabel"]:
             for t in tokenize(ph):
                 if t not in seen:
                     seen.add(t)
                     toks.append(t)
         payload["expansion_tokens"] = toks
-    else:
-        payload["source"] = payload["source"] or "None"
 
     return payload
 
@@ -343,6 +402,7 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
         g = [tok]
         dbg = {
             "token": tok,
+            "lookup_token_used": tok,
             "source": "Not run (click 'Run SAO altLabel expansion now')",
             "best_sao_uri": None,
             "candidate_preview": [],
@@ -353,6 +413,7 @@ def search_with_expansion(inv, query, endpoint, expand_enabled, run_expansion_no
         }
 
         if expand_enabled:
+            # Only compute when button pressed; otherwise use cache if present
             if run_expansion_now or tok in st.session_state["sao_cache"]:
                 try:
                     if run_expansion_now or tok not in st.session_state["sao_cache"]:
@@ -395,6 +456,7 @@ st.title("Indexing Lab")
 
 ensure_state()
 
+# define variables at top level (avoid NameError on reruns)
 sheet_url = DEFAULT_SHEET_URL
 sheet_name = ""
 sparql_endpoint = DEFAULT_SPARQL_ENDPOINT
@@ -432,7 +494,6 @@ expand_query = st.checkbox(
     key="enable_sao",
 )
 
-run_expansion_now = False
 if expand_query:
     if st.button("Run SAO altLabel expansion now", key="run_sao_btn"):
         st.session_state["run_sao_now"] = True
@@ -469,9 +530,11 @@ if query.strip():
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
+            st.markdown("#### Expansion status per token (altLabels only)")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
                 st.write("Source:", item.get("source", "—"))
+                st.write("Lookup token used:", item.get("lookup_token_used", "—"))
 
                 if item.get("best_sao_uri"):
                     st.write("Matched SAO URI:")
@@ -486,19 +549,17 @@ if query.strip():
                 else:
                     st.write("Label candidates (preview): —")
 
-                if item.get("sao_uri_preview"):
-                    st.write("SAO-filtered URIs (preview):")
-                    for uri in item["sao_uri_preview"]:
-                        st.code(uri)
-
                 alts = item.get("altLabel", [])
                 st.write("altLabel:", ", ".join(alts) if alts else "—")
                 st.divider()
 
             if errors:
-                st.warning("\n".join(errors))
+                st.warning(
+                    "Some live SAO lookups timed out or failed. Fallback expansions may be shown where available.\n\n"
+                    + "\n".join(errors)
+                )
             else:
-                st.caption("Tip: Click 'Run SAO altLabel expansion now' after typing. Results are cached per session.")
+                st.caption("Tip: On Community Cloud, click 'Run SAO altLabel expansion now' only after you finish typing your query.")
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
