@@ -62,64 +62,73 @@ def build_inverted_index(df: pd.DataFrame, fields: List[str], id_col: str) -> Di
         doc_id = str(row.get(id_col, "")).strip()
         if not doc_id:
             continue
+
         blob = []
         for f in fields:
             if f in df.columns:
                 blob.append(str(row.get(f, "")))
+
         for tok in tokenize(" ".join(blob)):
             inv.setdefault(tok, set()).add(doc_id)
+
     return inv
 
 
-def simple_search(inv: Dict[str, set], query: str) -> Tuple[set, List[str]]:
-    toks = tokenize(query)
-    if not toks:
-        return set(), []
-    sets = [inv.get(t, set()) for t in toks]
-    return (set.intersection(*sets) if sets else set()), toks
+# -----------------------------
+# SPARQL helper (robust JSON)
+# -----------------------------
+def sparql_select_json(endpoint: str, sparql: str) -> dict:
+    """
+    Virtuoso endpoints (incl. Libris) are most reliable when you pass an explicit
+    JSON result format as a MIME type.
+    """
+    params = {
+        "query": sparql,
+        "format": "application/sparql-results+json",
+        "output": "application/sparql-results+json",
+    }
+    headers = {"Accept": "application/sparql-results+json"}
+    r = requests.get(endpoint, params=params, headers=headers, timeout=25)
+    r.raise_for_status()
+    return r.json()
 
 
 # -----------------------------
-# SAO SPARQL helpers (for expansion)
+# SAO query expansion via SPARQL
 # -----------------------------
 @st.cache_data(ttl=3600)
 def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
     sparql = f"""
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
     SELECT ?p ?oLabel WHERE {{
       VALUES ?term {{ <{term_uri}> }}
+
       {{
         ?term skos:broader ?o .
         ?o skos:prefLabel ?oLabel .
-        FILTER(lang(?oLabel)="sv")
+        FILTER(lang(?oLabel) = "sv")
         BIND("broader" AS ?p)
       }}
       UNION
       {{
         ?term skos:narrower ?o .
         ?o skos:prefLabel ?oLabel .
-        FILTER(lang(?oLabel)="sv")
+        FILTER(lang(?oLabel) = "sv")
         BIND("narrower" AS ?p)
       }}
       UNION
       {{
         ?term skos:altLabel ?oLabel .
-        FILTER(lang(?oLabel)="sv")
+        FILTER(lang(?oLabel) = "sv")
         BIND("altLabel" AS ?p)
       }}
     }}
     """
 
-    r = requests.get(
-        endpoint,
-        params={"query": sparql, "format": "json"},
-        headers={"Accept": "application/sparql-results+json"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()
-
+    data = sparql_select_json(endpoint, sparql)
     ctx = {"broader": [], "narrower": [], "altLabel": []}
+
     for b in data.get("results", {}).get("bindings", []):
         p = b["p"]["value"]
         lbl = b["oLabel"]["value"]
@@ -128,6 +137,7 @@ def sao_term_context(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
 
     for k in ctx:
         ctx[k] = sorted(set(ctx[k]), key=str.lower)
+
     return ctx
 
 
@@ -146,7 +156,6 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
         return None
 
     safe = token.replace('"', '\\"')
-    headers = {"Accept": "application/sparql-results+json"}
 
     # 1) Exact match
     sparql_exact = f"""
@@ -154,14 +163,13 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
     SELECT ?term ?label WHERE {{
       ?term skos:inScheme <https://id.kb.se/term/sao> ;
             skos:prefLabel ?label .
-      FILTER(lang(?label)="sv")
+      FILTER(lang(?label) = "sv")
       FILTER(LCASE(STR(?label)) = LCASE("{safe}"))
     }}
     LIMIT 5
     """
-    r = requests.get(endpoint, params={"query": sparql_exact, "format": "json"}, headers=headers, timeout=20)
-    r.raise_for_status()
-    bindings = r.json().get("results", {}).get("bindings", [])
+    data = sparql_select_json(endpoint, sparql_exact)
+    bindings = data.get("results", {}).get("bindings", [])
     if bindings:
         return bindings[0]["term"]["value"]
 
@@ -171,33 +179,31 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
     SELECT ?term ?label WHERE {{
       ?term skos:inScheme <https://id.kb.se/term/sao> ;
             skos:prefLabel ?label .
-      FILTER(lang(?label)="sv")
+      FILTER(lang(?label) = "sv")
       FILTER(STRSTARTS(LCASE(STR(?label)), LCASE("{safe}")))
     }}
-    LIMIT 20
+    LIMIT 30
     """
-    r = requests.get(endpoint, params={"query": sparql_starts, "format": "json"}, headers=headers, timeout=20)
-    r.raise_for_status()
-    bindings = r.json().get("results", {}).get("bindings", [])
+    data = sparql_select_json(endpoint, sparql_starts)
+    bindings = data.get("results", {}).get("bindings", [])
     if bindings:
-        # pick shortest label (often the most general/closest match)
         best = sorted(bindings, key=lambda b: len(b["label"]["value"]))[0]
         return best["term"]["value"]
 
-    # 3) Contains match (regex)
+    # 3) Contains match
+    # NOTE: token is interpolated into a regex; escape it.
     sparql_contains = f"""
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
     SELECT ?term ?label WHERE {{
       ?term skos:inScheme <https://id.kb.se/term/sao> ;
             skos:prefLabel ?label .
-      FILTER(lang(?label)="sv")
+      FILTER(lang(?label) = "sv")
       FILTER regex(str(?label), "{re.escape(token)}", "i")
     }}
     LIMIT 50
     """
-    r = requests.get(endpoint, params={"query": sparql_contains, "format": "json"}, headers=headers, timeout=20)
-    r.raise_for_status()
-    bindings = r.json().get("results", {}).get("bindings", [])
+    data = sparql_select_json(endpoint, sparql_contains)
+    bindings = data.get("results", {}).get("bindings", [])
     if not bindings:
         return None
 
@@ -205,8 +211,13 @@ def sao_lookup_best_term_uri(endpoint: str, token: str) -> Optional[str]:
     return best["term"]["value"]
 
 
-
 def expand_token(endpoint: str, token: str, include_hierarchy: bool) -> List[str]:
+    """
+    Expand a query token into additional tokens using SAO:
+      - altLabel (equivalence)
+      - broader/narrower (optional)
+    Returns expansion tokens (already tokenized to match the inverted index).
+    """
     uri = sao_lookup_best_term_uri(endpoint, token)
     if not uri:
         return []
@@ -220,7 +231,6 @@ def expand_token(endpoint: str, token: str, include_hierarchy: bool) -> List[str
     out: List[str] = []
     seen = set()
 
-    # Tokenize all returned labels so they match your inverted-index tokens
     for lbl in labels:
         for t in tokenize(lbl):
             if t == token:
@@ -233,43 +243,53 @@ def expand_token(endpoint: str, token: str, include_hierarchy: bool) -> List[str
     return out
 
 
-
 def search_with_expansion(
     inv: Dict[str, set],
     query: str,
     endpoint: str,
     expand: bool,
     include_hierarchy: bool,
-) -> Tuple[set, List[List[str]]]:
+) -> Tuple[set, List[List[str]], List[str]]:
+    """
+    AND across concepts; OR within each concept's expansions.
+    Returns (matching_ids, groups, errors).
+    """
     base_tokens = tokenize(query)
     if not base_tokens:
-        return set(), []
+        return set(), [], []
 
     groups: List[List[str]] = []
+    errors: List[str] = []
+
     for tok in base_tokens:
         g = [tok]
         if expand:
             try:
                 g += expand_token(endpoint, tok, include_hierarchy)
-            except Exception:
-                pass
-        # de-dup within group
+            except Exception as e:
+                errors.append(f"SAO expansion failed for '{tok}': {e}")
+
+        # de-dup within group, preserve order
         deduped = []
         seen = set()
         for t in g:
             if t not in seen:
                 seen.add(t)
                 deduped.append(t)
+
         groups.append(deduped)
 
-    sets: List[set] = []
+    # OR within each group
+    group_sets: List[set] = []
     for g in groups:
         s = set()
         for t in g:
             s |= inv.get(t, set())
-        sets.append(s)
+        group_sets.append(s)
 
-    return (set.intersection(*sets) if sets else set()), groups
+    # AND across groups
+    ids = set.intersection(*group_sets) if group_sets else set()
+    return ids, groups, errors
 
 
 # -----------------------------
@@ -282,7 +302,6 @@ with st.sidebar:
     sheet_url = st.text_input("Google Sheet URL", DEFAULT_SHEET_URL)
     sheet_name = st.text_input("Worksheet name (optional)", "")
     sparql_endpoint = st.text_input("SPARQL endpoint", DEFAULT_SPARQL_ENDPOINT)
-
     if st.button("Refresh data"):
         st.cache_data.clear()
 
@@ -315,14 +334,16 @@ else:
 
 inv = build_inverted_index(df, fields, id_col)
 
-ids, groups = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy)
+ids, groups, errors = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy)
 
 if query.strip():
-    # Always show expansion if enabled, even when there are no local hits
+    # Always show related terms (expansion) even with 0 hits
     if expand_query:
         with st.expander("Query expansion", expanded=True):
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
+            if errors:
+                st.error("\n".join(errors))
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
@@ -332,4 +353,3 @@ if query.strip():
         st.warning("No results")
 else:
     st.info("Enter a query to search.")
-
