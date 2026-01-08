@@ -20,7 +20,7 @@ INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"
 SAO_SCHEME_URI = "https://id.kb.se/term/sao"
 
 # Community Cloud tuning
-SPARQL_TIMEOUT_SECONDS = 20
+SPARQL_TIMEOUT_SECONDS = 60
 SPARQL_RETRIES = 2
 SPARQL_BACKOFF_SECONDS = 1
 
