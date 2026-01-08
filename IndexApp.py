@@ -14,21 +14,21 @@ import streamlit as st
 # -----------------------------
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/11J5JRtap7p2P8BWl3gsPVs1I-DATbVdOi4Oj1fcSbe0/edit?usp=sharing"
 
-# SAO in id.kb.se
+# id.kb.se
 IDKB_FIND_ENDPOINT = "https://id.kb.se/find"
-SAO_SCHEME_URI = "https://id.kb.se/term/sao"
+SAO_SCHEME_URI = "https://id.kb.se/term/sao"  # IMPORTANT: no trailing slash :contentReference[oaicite:1]{index=1}
 
 BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
 
-# Community Cloud tuning
+# Streamlit Community Cloud tuning
 HTTP_TIMEOUT_SECONDS = 15
 HTTP_RETRIES = 2
 HTTP_BACKOFF_SECONDS = 1
 
-FIND_LIMIT = 12                 # how many candidate concepts to show
-RELATED_URI_LIMIT = 8           # cap on broader/narrower URIs fetched for labels
-RELATED_LABEL_FETCH_LIMIT = 8   # labels to resolve (per category)
+FIND_LIMIT = 15
+RELATED_URI_LIMIT = 10
+RELATED_LABEL_RESOLVE_LIMIT = 10
 
 
 # -----------------------------
@@ -86,19 +86,21 @@ def build_inverted_index(df: pd.DataFrame, fields: List[str], id_col: str) -> Di
 
 
 # -----------------------------
-# HTTP helper with retries
+# HTTP + JSON-LD extraction from HTML
 # -----------------------------
-def http_get_json(url: str, params: Optional[dict] = None, accept: str = "application/ld+json") -> Any:
-    last_err: Optional[Exception] = None
-    headers = {"Accept": accept}
+JSONLD_SCRIPT_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
 
+
+def http_get_text(url: str, params: Optional[dict] = None) -> str:
+    last_err: Optional[Exception] = None
     for attempt in range(0, 1 + HTTP_RETRIES):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
-
-            # Sometimes servers send JSON-LD as text/html; attempt JSON parse anyway
-            return r.json()
+            return r.text
         except Exception as e:
             last_err = e
             if attempt < HTTP_RETRIES:
@@ -108,53 +110,33 @@ def http_get_json(url: str, params: Optional[dict] = None, accept: str = "applic
     raise last_err  # type: ignore
 
 
-# -----------------------------
-# id.kb.se/find parsing
-# -----------------------------
-def _extract_uri(obj: Any) -> Optional[str]:
-    if isinstance(obj, str):
-        return obj
-    if isinstance(obj, dict):
-        return obj.get("@id") or obj.get("id")
-    return None
-
-
-def _extract_sv_label(obj: Any) -> Optional[str]:
+def extract_jsonld_objects_from_html(html: str) -> List[Any]:
     """
-    Try a variety of label fields commonly seen in JSON-LD/KB payloads.
+    id.kb.se pages commonly embed JSON-LD in HTML.
+    We extract all <script type="application/ld+json"> blocks and parse them.
     """
-    if not isinstance(obj, dict):
-        return None
-
-    # common keys
-    for key in ("prefLabel", "label", "name"):
-        v = obj.get(key)
-        if isinstance(v, str):
-            return v
-        if isinstance(v, dict):
-            # language map style
-            if "sv" in v and isinstance(v["sv"], str):
-                return v["sv"]
-        if isinstance(v, list):
-            # list of language-tagged values
-            for item in v:
-                if isinstance(item, dict):
-                    if item.get("@language") == "sv" and isinstance(item.get("@value"), str):
-                        return item["@value"]
-                    if item.get("lang") == "sv" and isinstance(item.get("value"), str):
-                        return item["value"]
-    return None
+    objs: List[Any] = []
+    for m in JSONLD_SCRIPT_RE.finditer(html or ""):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        try:
+            objs.append(json.loads(raw))
+        except Exception:
+            # Some pages may contain multiple JSON objects separated oddly; ignore failures
+            continue
+    return objs
 
 
-def _flatten_graph(doc: Any) -> List[dict]:
+def flatten_jsonld_graph(doc: Any) -> List[dict]:
     """
-    Flatten JSON-LD structures to a list of node dicts.
+    Turn a JSON-LD document (or list of docs) into a list of node dicts.
     """
     if isinstance(doc, list):
-        nodes = []
+        out: List[dict] = []
         for d in doc:
-            nodes.extend(_flatten_graph(d))
-        return nodes
+            out.extend(flatten_jsonld_graph(d))
+        return out
 
     if not isinstance(doc, dict):
         return []
@@ -162,76 +144,77 @@ def _flatten_graph(doc: Any) -> List[dict]:
     if "@graph" in doc and isinstance(doc["@graph"], list):
         return [n for n in doc["@graph"] if isinstance(n, dict)]
 
-    # Sometimes it's a single node document
+    # sometimes the doc itself is the node
     return [doc]
 
 
-@st.cache_data(ttl=3600)
-def sao_find_candidates(q: str, limit: int = FIND_LIMIT) -> List[dict]:
+def fetch_jsonld_from_page(url: str, params: Optional[dict] = None) -> List[dict]:
     """
-    Query id.kb.se/find for SAO candidates.
-    Uses the scheme facet parameter seen in the id.kb.se UI: and-inScheme.@id=<SAO>.
-    :contentReference[oaicite:1]{index=1}
+    Fetch HTML and extract JSON-LD nodes.
     """
-    q = (q or "").strip()
-    if len(q) < 2:
-        return []
+    html = http_get_text(url, params=params)
+    jsonld_docs = extract_jsonld_objects_from_html(html)
+    nodes: List[dict] = []
+    for d in jsonld_docs:
+        nodes.extend(flatten_jsonld_graph(d))
+    return nodes
 
-    params = {
-        "q": q,
-        "_limit": str(limit),
-        # observed facet parameter name in the SAO UI URL
-        "and-inScheme.@id": SAO_SCHEME_URI,
-    }
 
-    # Try JSON-LD via Accept header; if it fails, fall back to trying a format param
-    try:
-        doc = http_get_json(IDKB_FIND_ENDPOINT, params=params, accept="application/ld+json")
-    except Exception:
-        # fallback attempt (some services respect _format)
-        params2 = dict(params)
-        params2["_format"] = "application/ld+json"
-        doc = http_get_json(IDKB_FIND_ENDPOINT, params=params2, accept="application/json")
+def extract_uri(node: Any) -> Optional[str]:
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict):
+        return node.get("@id") or node.get("id")
+    return None
 
-    nodes = _flatten_graph(doc)
 
-    candidates: List[dict] = []
-    for n in nodes:
-        uri = _extract_uri(n)
-        lbl = _extract_sv_label(n)
-        if uri and lbl:
-            candidates.append({"label": lbl, "uri": uri})
+def extract_sv_label(node: dict) -> Optional[str]:
+    """
+    Try common label patterns.
+    """
+    for key in ("prefLabel", "label", "name"):
+        v = node.get(key)
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict) and isinstance(v.get("sv"), str):
+            return v["sv"]
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict) and item.get("@language") == "sv" and isinstance(item.get("@value"), str):
+                    return item["@value"]
+    return None
 
-    # de-dup by uri, preserve order
+
+def collect_literal_sv_list(v: Any) -> List[str]:
+    out: List[str] = []
+
+    def add(item: Any):
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            if item.get("@language") == "sv" and isinstance(item.get("@value"), str):
+                out.append(item["@value"])
+            elif isinstance(item.get("sv"), str):
+                out.append(item["sv"])
+
+    if isinstance(v, list):
+        for item in v:
+            add(item)
+    else:
+        add(v)
+
+    # de-dup case-insensitive
     seen = set()
-    out = []
-    for c in candidates:
-        if c["uri"] not in seen:
-            seen.add(c["uri"])
-            out.append(c)
-
-    # Heuristic: prefer exact label match first, then shortest label
-    q_low = q.lower()
-    out.sort(key=lambda x: (0 if x["label"].lower() == q_low else 1, len(x["label"])))
-    return out[:limit]
+    ded = []
+    for s in out:
+        k = s.lower()
+        if k not in seen:
+            seen.add(k)
+            ded.append(s)
+    return ded
 
 
-@st.cache_data(ttl=3600)
-def idkb_fetch_concept(uri: str) -> dict:
-    """
-    Fetch a concept URI as JSON-LD.
-    """
-    try:
-        return http_get_json(uri, params=None, accept="application/ld+json")
-    except Exception:
-        # some resources may require explicit format param
-        return http_get_json(uri, params={"_format": "application/ld+json"}, accept="application/json")
-
-
-def _collect_related_uris(nodes: List[dict], predicate: str) -> List[str]:
-    """
-    Collect related URIs from nodes for a given predicate (e.g. broader/narrower/altLabel).
-    """
+def collect_related_uris(nodes: List[dict], predicate: str) -> List[str]:
     out: List[str] = []
     for n in nodes:
         v = n.get(predicate)
@@ -239,96 +222,95 @@ def _collect_related_uris(nodes: List[dict], predicate: str) -> List[str]:
             continue
         if isinstance(v, list):
             for item in v:
-                u = _extract_uri(item)
+                u = extract_uri(item)
                 if u:
                     out.append(u)
         else:
-            u = _extract_uri(v)
+            u = extract_uri(v)
             if u:
                 out.append(u)
-    # de-dup, preserve order
+
     seen = set()
-    deduped = []
+    ded = []
     for u in out:
         if u not in seen:
             seen.add(u)
-            deduped.append(u)
-    return deduped
+            ded.append(u)
+    return ded
 
 
-def _collect_alt_labels(nodes: List[dict]) -> List[str]:
-    """
-    altLabel is usually literal strings (or language-tagged values) rather than URIs.
-    """
-    vals: List[str] = []
+# -----------------------------
+# SAO lookup via id.kb.se/find (HTML + JSON-LD extraction)
+# -----------------------------
+@st.cache_data(ttl=3600)
+def sao_find_candidates(q: str, limit: int = FIND_LIMIT) -> List[dict]:
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+
+    params = {
+        "q": q,
+        "_limit": str(limit),
+        # This filter works in the UI and yields SAO hits for klimat :contentReference[oaicite:2]{index=2}
+        "and-inScheme.@id": SAO_SCHEME_URI,
+    }
+
+    nodes = fetch_jsonld_from_page(IDKB_FIND_ENDPOINT, params=params)
+
+    # Extract candidate nodes with both uri + label
+    cands: List[dict] = []
     for n in nodes:
-        v = n.get("altLabel") or n.get("skos:altLabel")
-        if v is None:
-            continue
+        uri = extract_uri(n)
+        lbl = extract_sv_label(n)
+        if uri and lbl:
+            cands.append({"label": lbl, "uri": uri})
 
-        def add_item(item: Any):
-            if isinstance(item, str):
-                vals.append(item)
-            elif isinstance(item, dict):
-                if item.get("@language") == "sv" and isinstance(item.get("@value"), str):
-                    vals.append(item["@value"])
-                elif "sv" in item and isinstance(item["sv"], str):
-                    vals.append(item["sv"])
-
-        if isinstance(v, list):
-            for item in v:
-                add_item(item)
-        else:
-            add_item(v)
-
-    # de-dup
+    # de-dup by URI
     seen = set()
     out = []
-    for x in vals:
-        if x.lower() not in seen:
-            seen.add(x.lower())
-            out.append(x)
-    return out
+    for c in cands:
+        if c["uri"] not in seen:
+            seen.add(c["uri"])
+            out.append(c)
+
+    # prefer exact label match, then shorter label
+    q_low = q.lower()
+    out.sort(key=lambda x: (0 if x["label"].lower() == q_low else 1, len(x["label"])))
+    return out[:limit]
 
 
 @st.cache_data(ttl=3600)
-def resolve_labels_for_uris(uris: List[str], limit: int = RELATED_LABEL_FETCH_LIMIT) -> List[str]:
+def fetch_concept_nodes(uri: str) -> List[dict]:
     """
-    Dereference a small number of URIs to get Swedish labels.
-    (We limit per category for performance; this does not limit SAO coverage, only how many
-     related labels we resolve for display.)
+    Concept pages also embed JSON-LD; extract nodes from HTML.
     """
-    out: List[str] = []
+    return fetch_jsonld_from_page(uri, params=None)
+
+
+@st.cache_data(ttl=3600)
+def resolve_labels_for_uris(uris: List[str], limit: int = RELATED_LABEL_RESOLVE_LIMIT) -> List[str]:
+    labels: List[str] = []
     for u in uris[:limit]:
         try:
-            doc = idkb_fetch_concept(u)
-            nodes = _flatten_graph(doc)
+            nodes = fetch_concept_nodes(u)
             lbl = None
             for n in nodes:
-                lbl = _extract_sv_label(n)
+                lbl = extract_sv_label(n)
                 if lbl:
                     break
-            out.append(lbl or u)
+            labels.append(lbl or u)
         except Exception:
-            out.append(u)
-    return out
+            labels.append(u)
+    return labels
 
 
 def compute_sao_expansion_for_token(token: str, include_hierarchy: bool) -> dict:
-    """
-    Main expansion pipeline:
-      - find candidates via id.kb.se/find
-      - choose best (exact label else first)
-      - fetch concept JSON-LD and extract altLabel/broader/narrower
-    """
     payload = {
         "token": token,
-        "source": "id.kb.se/find",
+        "source": "id.kb.se/find (HTML+JSON-LD)",
         "candidates": [],
-        "chosen": None,  # {"label","uri"}
+        "chosen": None,
         "altLabel": [],
-        "broader_uris": [],
-        "narrower_uris": [],
         "broader_labels": [],
         "narrower_labels": [],
         "expansion_tokens": [],
@@ -337,64 +319,66 @@ def compute_sao_expansion_for_token(token: str, include_hierarchy: bool) -> dict
 
     cands = sao_find_candidates(token, limit=FIND_LIMIT)
     payload["candidates"] = cands
-
     if not cands:
         payload["source"] = "id.kb.se/find (no hits)"
         return payload
 
-    # choose best candidate
     token_low = token.lower()
-    chosen = None
-    for c in cands:
-        if c["label"].lower() == token_low:
-            chosen = c
-            break
-    chosen = chosen or cands[0]
+    chosen = next((c for c in cands if c["label"].lower() == token_low), cands[0])
     payload["chosen"] = chosen
 
-    # fetch concept data
-    doc = idkb_fetch_concept(chosen["uri"])
-    nodes = _flatten_graph(doc)
+    # Fetch chosen concept JSON-LD
+    nodes = fetch_concept_nodes(chosen["uri"])
 
-    payload["altLabel"] = _collect_alt_labels(nodes)
+    # altLabel: try skos:altLabel + altLabel
+    alt = []
+    for n in nodes:
+        if "altLabel" in n:
+            alt.extend(collect_literal_sv_list(n["altLabel"]))
+        if "skos:altLabel" in n:
+            alt.extend(collect_literal_sv_list(n["skos:altLabel"]))
+    # de-dup
+    seen = set()
+    alt_ded = []
+    for a in alt:
+        k = a.lower()
+        if k not in seen:
+            seen.add(k)
+            alt_ded.append(a)
+    payload["altLabel"] = alt_ded
 
-    broader_uris = _collect_related_uris(nodes, "broader")[:RELATED_URI_LIMIT] if include_hierarchy else []
-    narrower_uris = _collect_related_uris(nodes, "narrower")[:RELATED_URI_LIMIT] if include_hierarchy else []
-
-    payload["broader_uris"] = broader_uris
-    payload["narrower_uris"] = narrower_uris
-
-    # resolve a limited number of related labels for display
     if include_hierarchy:
-        payload["broader_labels"] = resolve_labels_for_uris(broader_uris, limit=RELATED_LABEL_FETCH_LIMIT)
-        payload["narrower_labels"] = resolve_labels_for_uris(narrower_uris, limit=RELATED_LABEL_FETCH_LIMIT)
+        broader_uris = collect_related_uris(nodes, "broader")[:RELATED_URI_LIMIT]
+        narrower_uris = collect_related_uris(nodes, "narrower")[:RELATED_URI_LIMIT]
 
-    # Build expansion tokens for retrieval (tokenize labels/altLabels/related labels)
+        payload["broader_labels"] = resolve_labels_for_uris(broader_uris, limit=RELATED_LABEL_RESOLVE_LIMIT)
+        payload["narrower_labels"] = resolve_labels_for_uris(narrower_uris, limit=RELATED_LABEL_RESOLVE_LIMIT)
+
+    # Build expansion tokens (for retrieval), based on alt/broader/narrower labels
     phrases = []
     phrases.extend(payload["altLabel"])
     if include_hierarchy:
         phrases.extend(payload["broader_labels"])
         phrases.extend(payload["narrower_labels"])
 
-    seen = set([token_low])
+    seen_tok = set([token_low])
     expanded = []
     for ph in phrases:
         for t in tokenize(ph):
-            if t not in seen:
-                seen.add(t)
+            if t not in seen_tok:
+                seen_tok.add(t)
                 expanded.append(t)
+
     payload["expansion_tokens"] = expanded
     return payload
 
 
 # -----------------------------
-# Search orchestration with session cache and explicit button
+# Search orchestration (explicit run + session cache)
 # -----------------------------
 def ensure_state():
     if "sao_cache" not in st.session_state:
-        st.session_state["sao_cache"] = {}  # token -> payload
-    if "run_sao" not in st.session_state:
-        st.session_state["run_sao"] = False
+        st.session_state["sao_cache"] = {}
 
 
 def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool, include_hierarchy: bool, run_now: bool):
@@ -403,29 +387,25 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
         return set(), [], [], []
 
     ensure_state()
-
     groups: List[List[str]] = []
     errors: List[str] = []
     debug: List[dict] = []
 
     for tok in tokens:
         group = [tok]
-        dbg = {"token": tok, "source": "none", "chosen": None, "altLabel": [], "broader_labels": [], "narrower_labels": []}
+        dbg = {"token": tok, "source": "none", "chosen": None, "candidates": [], "altLabel": [], "broader_labels": [], "narrower_labels": []}
 
         if expand_enabled:
-            # compute only when explicitly triggered OR use cached result
             if run_now or tok in st.session_state["sao_cache"]:
                 try:
                     if run_now or tok not in st.session_state["sao_cache"]:
-                        st.session_state["sao_cache"][tok] = compute_sao_expansion_for_token(
-                            token=tok, include_hierarchy=include_hierarchy
-                        )
+                        st.session_state["sao_cache"][tok] = compute_sao_expansion_for_token(tok, include_hierarchy)
                     dbg = st.session_state["sao_cache"][tok]
                     group += dbg.get("expansion_tokens", [])
                 except Exception as e:
                     errors.append(f"SAO expansion failed for '{tok}': {e}")
 
-        # de-dup
+        # de-dup group
         deduped = []
         seen = set()
         for t in group:
@@ -436,7 +416,7 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
         groups.append(deduped)
         debug.append(dbg)
 
-    # OR within each group, AND across groups
+    # OR within group, AND across groups
     sets = []
     for g in groups:
         s = set()
@@ -453,7 +433,7 @@ def search_with_expansion(inv: Dict[str, set], query: str, expand_enabled: bool,
 st.set_page_config(page_title="Indexing Lab", layout="wide")
 st.title("Indexing Lab")
 
-# define variables top-level to avoid NameError on reruns
+# Define variables top-level to avoid rerun NameErrors
 sheet_url = DEFAULT_SHEET_URL
 sheet_name = ""
 
@@ -470,19 +450,19 @@ if df.empty:
 
 id_col = st.selectbox("ID column", options=list(df.columns))
 
-available_baseline = [f for f in BASELINE_FIELDS if f in df.columns]
-available_index = [f for f in INDEX_FIELDS if f in df.columns]
-
 query = st.text_input("Query")
 
-expand_query = st.checkbox("Enable SAO expansion (via id.kb.se/find)", value=False)
-include_hierarchy = st.checkbox("Include broader/narrower terms (dereference URIs)", value=True)
+expand_query = st.checkbox("Enable SAO expansion (id.kb.se/find)", value=False)
+include_hierarchy = st.checkbox("Include broader/narrower terms", value=True)
 
 run_now = False
 if expand_query:
     run_now = st.button("Run SAO expansion now")
 
 mode = st.radio("Search mode", ["Baseline", "Enriched"], horizontal=True)
+
+available_baseline = [f for f in BASELINE_FIELDS if f in df.columns]
+available_index = [f for f in INDEX_FIELDS if f in df.columns]
 
 if mode == "Baseline":
     default_fields = available_baseline if available_baseline else list(df.columns)[:3]
@@ -503,7 +483,7 @@ if query.strip():
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
-            st.markdown("#### SAO lookup and hierarchy (what students should learn)")
+            st.markdown("#### SAO lookup and hierarchy")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
                 st.write("Source:", item.get("source", "—"))
@@ -515,7 +495,6 @@ if query.strip():
                 else:
                     st.write("Chosen concept: —")
 
-                # show candidates (disambiguation)
                 cands = item.get("candidates", [])
                 if cands:
                     st.write("Top candidates (disambiguation):")
@@ -532,7 +511,7 @@ if query.strip():
             if errors:
                 st.warning("\n".join(errors))
             else:
-                st.caption("Tip: On Community Cloud, click 'Run SAO expansion now' after you finish typing.")
+                st.caption("Tip: On Streamlit Community Cloud, click 'Run SAO expansion now' after typing your query.")
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
