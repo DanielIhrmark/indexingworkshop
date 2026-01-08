@@ -14,25 +14,26 @@ import streamlit as st
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/11J5JRtap7p2P8BWl3gsPVs1I-DATbVdOi4Oj1fcSbe0/edit?usp=sharing"
 DEFAULT_SPARQL_ENDPOINT = "https://libris.kb.se/sparql"
 
-# IMPORTANT: use trailing-slash scheme URI (matches Libris SPARQL prefix listing) :contentReference[oaicite:1]{index=1}
-SAO_SCHEME_URIS = [
-    "https://id.kb.se/term/sao/",   # preferred
-    "https://id.kb.se/term/sao",    # tolerate non-slash if present
-]
-
-KBV = "https://id.kb.se/vocab/"
-
 BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
+
+SAO_SCHEME_URI = "https://id.kb.se/term/sao"
 
 # Community Cloud tuning
 SPARQL_TIMEOUT_SECONDS = 20
 SPARQL_RETRIES = 2
 SPARQL_BACKOFF_SECONDS = 1
 
-# Keep endpoint load modest
-CANDIDATE_LIMIT = 15
-ALTLABEL_LIMIT = 50
+LABEL_CANDIDATE_LIMIT = 15
+SAO_FILTER_LIMIT = 15
+
+# Offline fallback (extend as needed for workshop stability)
+FALLBACK_EXPANSIONS = {
+    "klimat": ["klimatförändring", "global uppvärmning", "växthuseffekt", "miljö"],
+    "politik": ["politiska partier", "ideologi", "demokrati", "förvaltning"],
+    "energi": ["energipolitik", "energiförsörjning", "förnybar energi"],
+    "migration": ["invandring", "asylpolitik", "integration"],
+}
 
 
 # -----------------------------
@@ -116,181 +117,280 @@ def sparql_select_json(endpoint: str, sparql: str) -> dict:
 
 
 # -----------------------------
-# SAO lookup (SPARQL) + altLabels only
+# SAO: minimal SPARQL (kept small)
 # -----------------------------
 @st.cache_data(ttl=3600)
-def sao_candidates(endpoint: str, token: str, limit: int = CANDIDATE_LIMIT) -> List[Tuple[str, str]]:
-    """
-    Return SAO candidate concepts as (uri, prefLabel).
-    Fixes:
-      - accept BOTH SAO scheme URIs (with/without trailing slash)
-      - accept kbv:inScheme OR skos:inScheme
-      - accept kbv:prefLabel OR skos:prefLabel OR rdfs:label
-    """
+def label_search_candidates(endpoint: str, token: str, mode: str, limit: int = LABEL_CANDIDATE_LIMIT) -> List[Tuple[str, str]]:
     token = (token or "").strip()
     if len(token) < 2:
         return []
 
     safe = token.replace('"', '\\"')
-    scheme_values = " ".join(f"<{u}>" for u in SAO_SCHEME_URIS)
+
+    if mode == "exact":
+        label_filter = f'FILTER(LCASE(STR(?label)) = LCASE("{safe}"))'
+    elif mode == "starts":
+        label_filter = f'FILTER(STRSTARTS(LCASE(STR(?label)), LCASE("{safe}")))'
+    else:
+        label_filter = f'FILTER regex(str(?label), "{re.escape(token)}", "i")'
 
     sparql = f"""
-    PREFIX kbv: <{KBV}>
+    PREFIX kbv: <https://id.kb.se/vocab/>
     PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
-    SELECT DISTINCT ?term ?label WHERE {{
-      VALUES ?scheme {{ {scheme_values} }}
-
-      ?term (kbv:inScheme|skos:inScheme) ?scheme .
-      ?term (kbv:prefLabel|skos:prefLabel|rdfs:label) ?label .
-      FILTER(lang(?label) = "sv")
-
-      # Starts-with first (fast), but keep a regex fallback for robustness
-      FILTER(
-        STRSTARTS(LCASE(STR(?label)), LCASE("{safe}"))
-        || regex(str(?label), "{re.escape(token)}", "i")
-      )
-    }}
-    LIMIT {int(limit)}
-    """
-    data = sparql_select_json(endpoint, sparql)
-    out: List[Tuple[str, str]] = []
-    for b in data.get("results", {}).get("bindings", []):
-        out.append((b["term"]["value"], b["label"]["value"]))
-
-    # de-dup by URI
-    seen = set()
-    ded = []
-    for uri, lbl in out:
-        if uri not in seen:
-            seen.add(uri)
-            ded.append((uri, lbl))
-
-    # prefer exact label match, then shortest
-    tok_low = token.lower()
-    ded.sort(key=lambda x: (0 if x[1].lower() == tok_low else 1, len(x[1])))
-    return ded
-
-
-@st.cache_data(ttl=3600)
-def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> List[str]:
-    """
-    Fetch Swedish altLabels for a specific SAO concept URI.
-    """
-    sparql = f"""
-    PREFIX kbv: <{KBV}>
-    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-
-    SELECT DISTINCT ?alt WHERE {{
-      VALUES ?term {{ <{term_uri}> }}
+    SELECT DISTINCT ?s ?label WHERE {{
       {{
-        ?term kbv:altLabel ?alt .
-        FILTER(lang(?alt) = "sv")
+        ?s kbv:prefLabel ?label .
+        FILTER(lang(?label) = "sv")
+        {label_filter}
       }}
       UNION
       {{
-        ?term skos:altLabel ?alt .
-        FILTER(lang(?alt) = "sv")
+        ?s skos:prefLabel ?label .
+        FILTER(lang(?label) = "sv")
+        {label_filter}
+      }}
+      UNION
+      {{
+        ?s rdfs:label ?label .
+        FILTER(lang(?label) = "sv")
+        {label_filter}
       }}
     }}
     LIMIT {int(limit)}
     """
     data = sparql_select_json(endpoint, sparql)
-    alts = [b["alt"]["value"] for b in data.get("results", {}).get("bindings", [])]
-
-    # de-dup case-insensitive
-    seen = set()
-    out = []
-    for a in alts:
-        k = a.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(a)
-    return out
+    return [(b["s"]["value"], b["label"]["value"]) for b in data.get("results", {}).get("bindings", [])]
 
 
+@st.cache_data(ttl=3600)
+def filter_to_sao(endpoint: str, uris: List[str], limit: int = SAO_FILTER_LIMIT) -> List[str]:
+    if not uris:
+        return []
+    uris = uris[:50]
+    values = " ".join(f"<{u}>" for u in uris)
+
+    sparql = f"""
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+    SELECT DISTINCT ?s WHERE {{
+      VALUES ?s {{ {values} }}
+      {{
+        ?s kbv:inScheme <{SAO_SCHEME_URI}> .
+      }}
+      UNION
+      {{
+        ?s skos:inScheme <{SAO_SCHEME_URI}> .
+      }}
+      UNION
+      {{
+        ?s kbv:inVocabulary <{SAO_SCHEME_URI}> .
+      }}
+    }}
+    LIMIT {int(limit)}
+    """
+    data = sparql_select_json(endpoint, sparql)
+    return [b["s"]["value"] for b in data.get("results", {}).get("bindings", [])]
+
+
+@st.cache_data(ttl=3600)
+def sao_context_raw(endpoint: str, term_uri: str) -> Dict[str, List[str]]:
+    sparql = f"""
+    PREFIX kbv: <https://id.kb.se/vocab/>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+    SELECT DISTINCT ?p ?oLabel WHERE {{
+      VALUES ?term {{ <{term_uri}> }}
+
+      {{
+        ?term kbv:altLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("altLabel" AS ?p)
+      }}
+      UNION
+      {{
+        ?term skos:altLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("altLabel" AS ?p)
+      }}
+      UNION
+      {{
+        ?term kbv:broader ?o .
+        ?o kbv:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("broader" AS ?p)
+      }}
+      UNION
+      {{
+        ?term skos:broader ?o .
+        ?o skos:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("broader" AS ?p)
+      }}
+      UNION
+      {{
+        ?n kbv:broader ?term .
+        ?n kbv:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("narrower" AS ?p)
+      }}
+      UNION
+      {{
+        ?n skos:broader ?term .
+        ?n skos:prefLabel ?oLabel .
+        FILTER(lang(?oLabel)="sv")
+        BIND("narrower" AS ?p)
+      }}
+    }}
+    """
+    data = sparql_select_json(endpoint, sparql)
+    ctx = {"broader": [], "narrower": [], "altLabel": []}
+    for b in data.get("results", {}).get("bindings", []):
+        p = b["p"]["value"]
+        lbl = b["oLabel"]["value"]
+        if p in ctx:
+            ctx[p].append(lbl)
+    for k in ctx:
+        ctx[k] = sorted(list(dict.fromkeys(ctx[k])), key=str.lower)
+    return ctx
+
+
+def best_sao_uri_for_token(endpoint: str, token: str) -> Tuple[Optional[str], List[Tuple[str, str]], List[str]]:
+    cands = label_search_candidates(endpoint, token, mode="exact")
+    if not cands:
+        cands = label_search_candidates(endpoint, token, mode="starts")
+    if not cands:
+        cands = label_search_candidates(endpoint, token, mode="contains")
+
+    sao_uris = filter_to_sao(endpoint, [u for (u, _) in cands])
+    if sao_uris:
+        sao_set = set(sao_uris)
+        sao_cands = [(u, lbl) for (u, lbl) in cands if u in sao_set]
+        if sao_cands:
+            best = sorted(sao_cands, key=lambda x: len(x[1]))[0]
+            return best[0], cands, sao_uris
+
+    return None, cands, sao_uris
+
+
+# -----------------------------
+# Expansion: explicit run + session cache + fallback
+# -----------------------------
 def ensure_state():
     if "sao_cache" not in st.session_state:
-        st.session_state["sao_cache"] = {}
-    if "enable_sao" not in st.session_state:
-        st.session_state["enable_sao"] = False
-    if "run_sao_now" not in st.session_state:
-        st.session_state["run_sao_now"] = False
+        st.session_state["sao_cache"] = {}  # token -> payload
 
 
-def compute_altlabel_expansion_for_token(endpoint: str, token: str) -> dict:
+def compute_expansion_for_token(endpoint: str, token: str, include_hierarchy: bool) -> Dict:
     payload = {
         "token": token,
-        "source": "SPARQL (libris.kb.se)",
-        "candidates": [],
-        "chosen": None,
-        "altLabel": [],
+        "source": "none",
+        "best_sao_uri": None,
+        "candidate_count": 0,
+        "candidate_preview": [],
+        "sao_uri_count": 0,
+        "sao_uri_preview": [],
+        "raw_altLabel": [],
+        "raw_broader": [],
+        "raw_narrower": [],
         "expansion_tokens": [],
         "error": None,
     }
 
-    cands = sao_candidates(endpoint, token, limit=CANDIDATE_LIMIT)
-    payload["candidates"] = [{"uri": u, "label": l} for (u, l) in cands]
+    # Try live SAO
+    try:
+        best_uri, candidates, sao_uris = best_sao_uri_for_token(endpoint, token)
+        payload["best_sao_uri"] = best_uri
+        payload["candidate_count"] = len(candidates)
+        payload["candidate_preview"] = [(lbl, uri) for (uri, lbl) in candidates[:5]]
+        payload["sao_uri_count"] = len(sao_uris)
+        payload["sao_uri_preview"] = sao_uris[:5]
 
-    if not cands:
-        payload["source"] = "SPARQL (no SAO candidates)"
-        return payload
+        if best_uri:
+            ctx = sao_context_raw(endpoint, best_uri)
+            payload["raw_altLabel"] = ctx.get("altLabel", [])
+            payload["raw_broader"] = ctx.get("broader", []) if include_hierarchy else []
+            payload["raw_narrower"] = ctx.get("narrower", []) if include_hierarchy else []
 
-    chosen_uri, chosen_lbl = cands[0]
-    payload["chosen"] = {"uri": chosen_uri, "label": chosen_lbl}
+            phrases = list(payload["raw_altLabel"])
+            if include_hierarchy:
+                phrases += payload["raw_broader"] + payload["raw_narrower"]
 
-    alts = sao_altlabels(endpoint, chosen_uri, limit=ALTLABEL_LIMIT)
-    payload["altLabel"] = alts
+            toks = []
+            seen = set([token])
+            for ph in phrases:
+                for t in tokenize(ph):
+                    if t not in seen:
+                        seen.add(t)
+                        toks.append(t)
 
-    # expansion tokens derived from altLabels
-    seen = set([token.lower()])
-    exp = []
-    for phrase in alts:
-        for t in tokenize(phrase):
-            if t not in seen:
-                seen.add(t)
-                exp.append(t)
-    payload["expansion_tokens"] = exp
+            payload["expansion_tokens"] = toks
+            payload["source"] = "SAO (live)"
+            return payload
+
+        # If we got here, SAO did not resolve to a term; fall back below
+
+    except Exception as e:
+        payload["error"] = str(e)
+
+    # Fallback expansions (offline)
+    if token in FALLBACK_EXPANSIONS:
+        payload["source"] = "Fallback (offline)"
+        payload["raw_altLabel"] = FALLBACK_EXPANSIONS[token]
+        # Use phrases as tokens too
+        toks = []
+        seen = set([token])
+        for ph in FALLBACK_EXPANSIONS[token]:
+            for t in tokenize(ph):
+                if t not in seen:
+                    seen.add(t)
+                    toks.append(t)
+        payload["expansion_tokens"] = toks
+
+    else:
+        payload["source"] = "None"
+
     return payload
 
 
-def search_with_expansion(inv: Dict[str, set], query: str, endpoint: str, expand_enabled: bool, run_now: bool):
-    tokens = tokenize(query)
-    if not tokens:
+def search_with_expansion(inv, query, endpoint, expand_enabled, include_hierarchy, run_expansion_now):
+    base_tokens = tokenize(query)
+    if not base_tokens:
         return set(), [], [], []
 
     ensure_state()
 
-    groups: List[List[str]] = []
-    errors: List[str] = []
-    debug: List[dict] = []
+    groups = []
+    errors = []
+    debug = []
 
-    for tok in tokens:
-        group = [tok]
-        dbg = {
-            "token": tok,
-            "source": "Not run (click 'Run SAO altLabel expansion')",
-            "candidates": [],
-            "chosen": None,
-            "altLabel": [],
-            "expansion_tokens": [],
-        }
+    for tok in base_tokens:
+        g = [tok]
+        dbg = {"token": tok, "source": "None", "expansion_tokens": []}
 
         if expand_enabled:
-            if run_now or tok in st.session_state["sao_cache"]:
+            # Only compute when button pressed; otherwise use cache if present
+            if run_expansion_now or tok in st.session_state["sao_cache"]:
                 try:
-                    if run_now or tok not in st.session_state["sao_cache"]:
-                        st.session_state["sao_cache"][tok] = compute_altlabel_expansion_for_token(endpoint, tok)
+                    if run_expansion_now or tok not in st.session_state["sao_cache"]:
+                        st.session_state["sao_cache"][tok] = compute_expansion_for_token(
+                            endpoint=endpoint,
+                            token=tok,
+                            include_hierarchy=include_hierarchy,
+                        )
                     dbg = st.session_state["sao_cache"][tok]
-                    group += dbg.get("expansion_tokens", [])
+                    g += dbg.get("expansion_tokens", [])
+                    if dbg.get("error"):
+                        errors.append(f"{tok}: {dbg['error']}")
                 except Exception as e:
-                    errors.append(f"SAO altLabel expansion failed for '{tok}': {e}")
+                    errors.append(f"{tok}: {e}")
 
         # de-dup group
         deduped = []
         seen = set()
-        for t in group:
+        for t in g:
             if t not in seen:
                 seen.add(t)
                 deduped.append(t)
@@ -316,8 +416,7 @@ def search_with_expansion(inv: Dict[str, set], query: str, endpoint: str, expand
 st.set_page_config(page_title="Indexing Lab", layout="wide")
 st.title("Indexing Lab")
 
-ensure_state()
-
+# define variables at top level (avoid NameError on reruns)
 sheet_url = DEFAULT_SHEET_URL
 sheet_name = ""
 sparql_endpoint = DEFAULT_SPARQL_ENDPOINT
@@ -330,37 +429,26 @@ with st.sidebar:
     if st.button("Refresh data"):
         st.cache_data.clear()
 
-    if st.button("Test SPARQL endpoint"):
-        try:
-            test = sparql_select_json(sparql_endpoint, "SELECT (1 as ?ok) WHERE {} LIMIT 1")
-            st.success(f"Endpoint OK: {test['results']['bindings']}")
-        except Exception as e:
-            st.error(f"Endpoint test failed: {e}")
-
 df = load_sheet_as_df(sheet_url, sheet_name)
 if df.empty:
     st.warning("The sheet loaded, but it appears to be empty.")
     st.stop()
 
 id_col = st.selectbox("ID column", options=list(df.columns))
-query = st.text_input("Query")
-
-expand_query = st.checkbox(
-    "Enable SAO altLabel expansion (SPARQL)",
-    value=st.session_state["enable_sao"],
-    key="enable_sao",
-)
-
-if expand_query:
-    if st.button("Run SAO altLabel expansion", key="run_sao_btn"):
-        st.session_state["run_sao_now"] = True
-else:
-    st.session_state["run_sao_now"] = False
-
-mode = st.radio("Search mode", ["Baseline", "Enriched"], horizontal=True)
 
 available_baseline = [f for f in BASELINE_FIELDS if f in df.columns]
 available_index = [f for f in INDEX_FIELDS if f in df.columns]
+
+query = st.text_input("Query")
+
+expand_query = st.checkbox("Enable SAO expansion", value=False)
+include_hierarchy = st.checkbox("Include broader/narrower terms", value=True)
+
+run_expansion_now = False
+if expand_query:
+    run_expansion_now = st.button("Run SAO expansion now")
+
+mode = st.radio("Search mode", ["Baseline", "Enriched"], horizontal=True)
 
 if mode == "Baseline":
     default_fields = available_baseline if available_baseline else list(df.columns)[:3]
@@ -373,51 +461,32 @@ else:
 
 inv = build_inverted_index(df, fields, id_col)
 
-ids, groups, errors, debug = search_with_expansion(
-    inv=inv,
-    query=query,
-    endpoint=sparql_endpoint,
-    expand_enabled=expand_query,
-    run_now=st.session_state["run_sao_now"],
-)
-
-# reset one-shot flag after use
-st.session_state["run_sao_now"] = False
+ids, groups, errors, debug = search_with_expansion(inv, query, sparql_endpoint, expand_query, include_hierarchy, run_expansion_now)
 
 if query.strip():
     if expand_query:
-        with st.expander("SAO matches and altLabels", expanded=True):
+        with st.expander("Query expansion (debug)", expanded=True):
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
+            st.markdown("#### Expansion status per token")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
-                st.write("Source:", item.get("source", "—"))
-
-                chosen = item.get("chosen")
-                if chosen:
-                    st.write("Matched SAO prefLabel:", chosen.get("label", "—"))
-                    st.code(chosen.get("uri", "—"))
-                else:
-                    st.write("Matched SAO prefLabel: —")
-                    st.write("Matched SAO URI: —")
-
-                cands = item.get("candidates", [])
-                if cands:
-                    st.write("Top candidates:")
-                    for c in cands[:8]:
-                        st.write(f"- {c['label']}")
-                else:
-                    st.write("Top candidates: —")
-
-                alts = item.get("altLabel", [])
-                st.write("altLabel:", ", ".join(alts) if alts else "—")
+                st.write("Source:", item.get("source", "None"))
+                if item.get("best_sao_uri"):
+                    st.code(item["best_sao_uri"])
+                st.write("altLabel:", ", ".join(item.get("raw_altLabel", [])) if item.get("raw_altLabel") else "—")
+                st.write("broader:", ", ".join(item.get("raw_broader", [])) if item.get("raw_broader") else "—")
+                st.write("narrower:", ", ".join(item.get("raw_narrower", [])) if item.get("raw_narrower") else "—")
                 st.divider()
 
             if errors:
-                st.warning("\n".join(errors))
+                st.warning(
+                    "Live SAO lookups timed out or failed. The app may show fallback expansions instead.\n\n"
+                    + "\n".join(errors)
+                )
             else:
-                st.caption("Tip: Click 'Run SAO altLabel expansion' after typing. Results are cached per session.")
+                st.caption("Tip: On Community Cloud, click 'Run SAO expansion now' only after you finish typing your query.")
 
     if ids:
         res = df[df[id_col].astype(str).isin(ids)].copy()
