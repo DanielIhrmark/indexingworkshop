@@ -14,11 +14,14 @@ import streamlit as st
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/11J5JRtap7p2P8BWl3gsPVs1I-DATbVdOi4Oj1fcSbe0/edit?usp=sharing"
 DEFAULT_SPARQL_ENDPOINT = "https://libris.kb.se/sparql"
 
-# SAO scheme
-SAO_SCHEME_URI = "https://id.kb.se/term/sao"
+# IMPORTANT: use trailing-slash scheme URI (matches Libris SPARQL prefix listing) :contentReference[oaicite:1]{index=1}
+SAO_SCHEME_URIS = [
+    "https://id.kb.se/term/sao/",   # preferred
+    "https://id.kb.se/term/sao",    # tolerate non-slash if present
+]
+
 KBV = "https://id.kb.se/vocab/"
 
-# Fields used for local search index
 BASELINE_FIELDS = ["title", "author", "abstract"]
 INDEX_FIELDS = ["keywords_free", "subjects_controlled", "ddc", "sab", "entities"]
 
@@ -27,9 +30,9 @@ SPARQL_TIMEOUT_SECONDS = 20
 SPARQL_RETRIES = 2
 SPARQL_BACKOFF_SECONDS = 1
 
-# Limit load on endpoint
-CANDIDATE_LIMIT = 10
-ALTLABEL_LIMIT = 30
+# Keep endpoint load modest
+CANDIDATE_LIMIT = 15
+ALTLABEL_LIMIT = 50
 
 
 # -----------------------------
@@ -119,42 +122,35 @@ def sparql_select_json(endpoint: str, sparql: str) -> dict:
 def sao_candidates(endpoint: str, token: str, limit: int = CANDIDATE_LIMIT) -> List[Tuple[str, str]]:
     """
     Return SAO candidate concepts as (uri, prefLabel).
-    Uses a UNION to support both:
-      - direct concept triples (term inScheme sao)
-      - KB meta wrapper pattern (:mainEntity) sometimes used in Libris XL examples
+    Fixes:
+      - accept BOTH SAO scheme URIs (with/without trailing slash)
+      - accept kbv:inScheme OR skos:inScheme
+      - accept kbv:prefLabel OR skos:prefLabel OR rdfs:label
     """
     token = (token or "").strip()
     if len(token) < 2:
         return []
 
     safe = token.replace('"', '\\"')
-    # Keep this relatively light: starts-with match first.
+    scheme_values = " ".join(f"<{u}>" for u in SAO_SCHEME_URIS)
+
     sparql = f"""
     PREFIX kbv: <{KBV}>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
     SELECT DISTINCT ?term ?label WHERE {{
-      {{
-        ?term kbv:inScheme <{SAO_SCHEME_URI}> ;
-              kbv:prefLabel ?label .
-        FILTER(lang(?label) = "sv")
-        FILTER(STRSTARTS(LCASE(STR(?label)), LCASE("{safe}")))
-      }}
-      UNION
-      {{
-        ?meta kbv:mainEntity ?term .
-        ?term kbv:inScheme <{SAO_SCHEME_URI}> ;
-              kbv:prefLabel ?label .
-        FILTER(lang(?label) = "sv")
-        FILTER(STRSTARTS(LCASE(STR(?label)), LCASE("{safe}")))
-      }}
-      UNION
-      {{
-        # fallback: regex contains (can be slower, but helps for multiword / inflections)
-        ?term kbv:inScheme <{SAO_SCHEME_URI}> ;
-              kbv:prefLabel ?label .
-        FILTER(lang(?label) = "sv")
-        FILTER regex(str(?label), "{re.escape(token)}", "i")
-      }}
+      VALUES ?scheme {{ {scheme_values} }}
+
+      ?term (kbv:inScheme|skos:inScheme) ?scheme .
+      ?term (kbv:prefLabel|skos:prefLabel|rdfs:label) ?label .
+      FILTER(lang(?label) = "sv")
+
+      # Starts-with first (fast), but keep a regex fallback for robustness
+      FILTER(
+        STRSTARTS(LCASE(STR(?label)), LCASE("{safe}"))
+        || regex(str(?label), "{re.escape(token)}", "i")
+      )
     }}
     LIMIT {int(limit)}
     """
@@ -162,13 +158,18 @@ def sao_candidates(endpoint: str, token: str, limit: int = CANDIDATE_LIMIT) -> L
     out: List[Tuple[str, str]] = []
     for b in data.get("results", {}).get("bindings", []):
         out.append((b["term"]["value"], b["label"]["value"]))
-    # de-dup
+
+    # de-dup by URI
     seen = set()
     ded = []
     for uri, lbl in out:
         if uri not in seen:
             seen.add(uri)
             ded.append((uri, lbl))
+
+    # prefer exact label match, then shortest
+    tok_low = token.lower()
+    ded.sort(key=lambda x: (0 if x[1].lower() == tok_low else 1, len(x[1])))
     return ded
 
 
@@ -176,7 +177,6 @@ def sao_candidates(endpoint: str, token: str, limit: int = CANDIDATE_LIMIT) -> L
 def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> List[str]:
     """
     Fetch Swedish altLabels for a specific SAO concept URI.
-    Tries both kbv:altLabel and skos:altLabel.
     """
     sparql = f"""
     PREFIX kbv: <{KBV}>
@@ -198,6 +198,7 @@ def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> 
     """
     data = sparql_select_json(endpoint, sparql)
     alts = [b["alt"]["value"] for b in data.get("results", {}).get("bindings", [])]
+
     # de-dup case-insensitive
     seen = set()
     out = []
@@ -211,7 +212,6 @@ def sao_altlabels(endpoint: str, term_uri: str, limit: int = ALTLABEL_LIMIT) -> 
 
 def ensure_state():
     if "sao_cache" not in st.session_state:
-        # token -> payload
         st.session_state["sao_cache"] = {}
     if "enable_sao" not in st.session_state:
         st.session_state["enable_sao"] = False
@@ -220,14 +220,11 @@ def ensure_state():
 
 
 def compute_altlabel_expansion_for_token(endpoint: str, token: str) -> dict:
-    """
-    Compute: candidates + choose best + altLabels + expansion tokens from altLabels.
-    """
     payload = {
         "token": token,
         "source": "SPARQL (libris.kb.se)",
         "candidates": [],
-        "chosen": None,  # (uri,label)
+        "chosen": None,
         "altLabel": [],
         "expansion_tokens": [],
         "error": None,
@@ -240,21 +237,14 @@ def compute_altlabel_expansion_for_token(endpoint: str, token: str) -> dict:
         payload["source"] = "SPARQL (no SAO candidates)"
         return payload
 
-    # choose: exact match if possible else first
-    tok_low = token.lower()
-    chosen = None
-    for u, l in cands:
-        if l.lower() == tok_low:
-            chosen = (u, l)
-            break
-    chosen = chosen or cands[0]
-    payload["chosen"] = {"uri": chosen[0], "label": chosen[1]}
+    chosen_uri, chosen_lbl = cands[0]
+    payload["chosen"] = {"uri": chosen_uri, "label": chosen_lbl}
 
-    alts = sao_altlabels(endpoint, chosen[0], limit=ALTLABEL_LIMIT)
+    alts = sao_altlabels(endpoint, chosen_uri, limit=ALTLABEL_LIMIT)
     payload["altLabel"] = alts
 
-    # expansion tokens from altLabels (single words)
-    seen = set([tok_low])
+    # expansion tokens derived from altLabels
+    seen = set([token.lower()])
     exp = []
     for phrase in alts:
         for t in tokenize(phrase):
@@ -308,7 +298,7 @@ def search_with_expansion(inv: Dict[str, set], query: str, endpoint: str, expand
         groups.append(deduped)
         debug.append(dbg)
 
-    # OR within each group, AND across groups
+    # OR within group, AND across groups
     group_sets = []
     for g in groups:
         s = set()
@@ -328,7 +318,6 @@ st.title("Indexing Lab")
 
 ensure_state()
 
-# Define top-level defaults (avoid NameError on reruns)
 sheet_url = DEFAULT_SHEET_URL
 sheet_name = ""
 sparql_endpoint = DEFAULT_SPARQL_ENDPOINT
@@ -356,14 +345,12 @@ if df.empty:
 id_col = st.selectbox("ID column", options=list(df.columns))
 query = st.text_input("Query")
 
-# Sticky enable + one-shot run flag
 expand_query = st.checkbox(
     "Enable SAO altLabel expansion (SPARQL)",
     value=st.session_state["enable_sao"],
     key="enable_sao",
 )
 
-run_now = False
 if expand_query:
     if st.button("Run SAO altLabel expansion", key="run_sao_btn"):
         st.session_state["run_sao_now"] = True
@@ -399,11 +386,10 @@ st.session_state["run_sao_now"] = False
 
 if query.strip():
     if expand_query:
-        with st.expander("SAO altLabel debug", expanded=True):
+        with st.expander("SAO matches and altLabels", expanded=True):
             for i, g in enumerate(groups, 1):
                 st.write(f"Concept {i}: " + " OR ".join(g))
 
-            st.markdown("#### SAO matches and altLabels")
             for item in debug:
                 st.markdown(f"**Token:** `{item.get('token')}`")
                 st.write("Source:", item.get("source", "—"))
